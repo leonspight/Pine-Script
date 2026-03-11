@@ -1,0 +1,2123 @@
+//@version=6
+strategy("Madstrat Strategy",
+         shorttitle="Madstrat",
+         overlay=true,
+         calc_on_every_tick=false,
+         process_orders_on_close=true,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=2,
+         initial_capital=10000,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         slippage=1,
+         max_bars_back=5000,
+         max_lines_count=500,
+         max_labels_count=500,
+         max_boxes_count=500)
+// ═══════════════════════════════════════════════════════════════════════
+// CHANGELOG (Improvements applied):
+// 1. FIX: Eliminated 4 duplicate request.security calls (H4, H1, 30m, 15m)
+//    - Removed f_get_cascade_data() — now derives [1] refs from existing HTF data
+// 2. FIX: Implemented trailing stop modes (EMA 9, EMA 18, Fixed Pips, ATR)
+//    - Was declared as input but had zero implementation
+// 3. FIX: Implemented i_breakevenOnFirstLevel logic
+//    - Was declared as input but never checked
+// 4. FIX: Removed stop= parameter from non-backtest entries
+//    - process_orders_on_close=true conflicts with stop entries
+// 5. FIX: Weekly labels now position at chart edge for visibility
+//    - Were placed at current_week_end (potentially off-screen)
+// 6. FIX: Variable shadowing in f_day_state_5m — all locals prefixed _5m_
+// 7. FIX: Implemented first-hour exhaustion zones (i_showFirstHourExhaustion)
+// 8. FIX: Removed dead i_maxConcurrentTrades variable
+// 9. FIX: Breakeven SL exits now guarded — only reissued when price changes
+// 10. FIX: Consolidated exhaustion zone search into f_find_exhaustion_zone()
+// 11. FIX: Clarified inside_day_freeze comments to match actual logic
+// ═══════════════════════════════════════════════════════════════════════
+
+// SECTION 1: CONSTANTS
+const int PREFIX_NONE = 0
+const int PREFIX_GSD  = 1
+const int PREFIX_RSD  = 2
+const int PREFIX_GD   = 3
+const int PREFIX_RD   = 4
+const int DLABEL_NORMAL      = 0
+const int DLABEL_INSIDE      = 1
+const int DLABEL_CLEAN_BULL  = 2
+const int DLABEL_CLEAN_BEAR  = 3
+const int DLABEL_FBR_BULL    = 4
+const int DLABEL_FBR_BEAR    = 5
+const int DLABEL_SETUP_GREEN = 6
+const int DLABEL_SETUP_RED   = 7
+const int DLABEL_INSIDE_CONT = 8
+
+// SECTION 2: INPUTS
+string group_backtest = "Backtest Settings"
+bool i_backtestMode = input.bool(true, "Enable Backtest Mode", group=group_backtest)
+bool i_useDefaultQty = input.bool(true, "Use Default Position Size", group=group_backtest)
+bool i_relaxedConditions = input.bool(false, "Relaxed Entry Conditions", group=group_backtest)
+string group_strategy = "Strategy Settings"
+string i_accountType = input.string("Live", "Account Type", options=["Live", "Prop Firm"], group=group_strategy)
+float i_riskPercent_A_Live = input.float(10.0, "A Setup Risk - Live (%)", minval=0.1, maxval=15.0, step=0.1, group=group_strategy)
+float i_riskPercent_B_Live = input.float(5.0, "B Setup Risk - Live (%)", minval=0.1, maxval=15.0, step=0.1, group=group_strategy)
+float i_riskPercent_A_Prop = input.float(1.0, "A Setup Risk - Prop (%)", minval=0.1, maxval=5.0, step=0.1, group=group_strategy)
+float i_riskPercent_B_Prop = input.float(0.5, "B Setup Risk - Prop (%)", minval=0.1, maxval=5.0, step=0.1, group=group_strategy)
+string i_setupType = input.string("Both A and B", "Setup Type to Trade", options=["A Setups Only", "B Setups Only", "Both A and B"], group=group_strategy)
+string group_timezone = "▸ Timezone"
+string i_masterTimezone = input.string("America/New_York", "Master Timezone", options=["America/New_York", "Europe/London", "Asia/Tokyo", "Asia/Hong_Kong", "Australia/Sydney", "UTC"], group=group_timezone)
+bool i_useChartTimezone = input.bool(false, "Use Chart Timezone Instead", group=group_timezone)
+string tz_effective = i_useChartTimezone ? syminfo.timezone : i_masterTimezone
+float i_riskPercent_A = i_accountType == "Live" ? i_riskPercent_A_Live : i_riskPercent_A_Prop
+float i_riskPercent_B = i_accountType == "Live" ? i_riskPercent_B_Live : i_riskPercent_B_Prop
+float i_minRR = input.float(2.0, "Minimum RR Required", minval=1.0, maxval=10.0, step=0.5, group=group_strategy)
+bool i_trade15m = input.bool(true, "Trade 15m Signals", group=group_strategy, inline="tf_trade")
+bool i_trade30m = input.bool(true, "Trade 30m Signals", group=group_strategy, inline="tf_trade")
+bool i_enforceFBRDirection = input.bool(true, "Enforce FBR Candle Direction (M-03)", group=group_strategy)
+bool i_enforceDailyDirection = input.bool(true, "Enforce Daily Candle Direction (W-13)", group=group_strategy)
+string i_directionLock = input.string("Both", "Direction Lock (v10)", options=["Both", "Long Only", "Short Only"], group=group_strategy, tooltip="Manual directional bias per pair.")
+string i_htfTrendMode = input.string("Off", "HTF Trend Filter (v10)", options=["Off", "Daily 50 EMA", "Daily EMA Stack", "H4 EMA", "Daily + H4"], group=group_strategy, tooltip="Optional dynamic filter using HTF EMA structure.")
+bool i_enforceDay4Rule = input.bool(true, "Enable Day 4 Breakout Rule (M-02)", group=group_strategy)
+bool i_enableInsideDayCont = input.bool(true, "Inside Day Continuation Mode (S1.2)", group=group_strategy)
+string group_risk = "▸ Risk"
+float i_spreadPips = input.float(1.5, "Est. Spread (pips)", minval=0.0, maxval=10.0, step=0.5, group=group_risk)
+float i_maxSlPips = input.float(30.0, "Max Stop Loss (pips)", minval=10.0, maxval=100.0, step=1.0, group=group_risk, tooltip="Hard cap on stop distance from entry.")
+bool i_enableBreakeven = input.bool(true, "Enable Breakeven Management", group=group_risk)
+float i_breakevenTriggerPips = input.float(10.0, "Breakeven Trigger (pips)", minval=1.0, maxval=50.0, step=1.0, group=group_risk)
+float i_breakevenOffsetPips = input.float(1.0, "Breakeven Offset (pips)", minval=0.0, maxval=10.0, step=0.5, group=group_risk)
+bool i_breakevenOnFirstLevel = input.bool(true, "Move to BE on First Daily Level", group=group_risk)
+string i_trailMode = input.string("None", "Trailing Stop After TP1 (S2.3)", options=["None", "EMA 9", "EMA 18", "Fixed Pips", "ATR"], group=group_risk)
+float i_tp1ClosePct = input.float(33.0, "TP1 Close %", minval=10.0, maxval=75.0, step=1.0, group=group_risk)
+float i_trailFixedPips = input.float(15.0, "Trail Fixed Pips", minval=1.0, maxval=100.0, step=1.0, group=group_risk)
+float i_trailAtrMult = input.float(1.5, "Trail ATR Multiplier", minval=0.5, maxval=5.0, step=0.25, group=group_risk)
+int i_trailAtrPeriod = input.int(14, "Trail ATR Period", minval=5, maxval=50, group=group_risk)
+bool i_enableM1R3Exit = input.bool(false, "Enable M1-R3 EMA Reversal Exit", group=group_risk)
+bool i_enableM1R1Exit = input.bool(false, "Enable M1-R1 Exhaustion Reject Exit", group=group_risk)
+bool i_enableDDBreaker = input.bool(false, "Enable Daily Drawdown Limit", group=group_risk)
+float i_maxDailyDD = input.float(5.0, "Max Daily Drawdown (%)", minval=1.0, maxval=25.0, step=0.5, group=group_risk)
+bool i_enableThreeStrike = input.bool(false, "Enable Three-Strike Rule", group=group_risk)
+int i_maxDailyLosses = input.int(3, "Max Daily Losses (Strikes)", minval=1, maxval=10, group=group_risk)
+bool i_enableTradeFreqLimit = input.bool(false, "Enable Trade Frequency Limits", group=group_risk)
+int i_maxDailyTrades = input.int(2, "Max Trades Per Day", minval=1, maxval=10, group=group_risk)
+int i_maxWeeklyTrades = input.int(4, "Max Trades Per Week", minval=1, maxval=20, group=group_risk)
+bool i_enableWeeklyDD = input.bool(false, "Enable Weekly Drawdown Limit (S3.3)", group=group_risk)
+float i_maxWeeklyDD = input.float(8.0, "Max Weekly Drawdown (%)", minval=2.0, maxval=30.0, step=1.0, group=group_risk)
+bool i_enableConsecLossLimit = input.bool(false, "Enable Consecutive Loss Limit (S3.3)", group=group_risk)
+int i_maxConsecLosses = input.int(2, "Max Consecutive Losses", minval=1, maxval=5, group=group_risk)
+string group_instrument = "Instrument Settings"
+string i_instrumentType = input.string("Auto-Detect", "Instrument Type", options=["Auto-Detect", "Gold/Metals", "Forex"], group=group_instrument)
+string group_confluence = "Confluence Settings"
+string i_confluenceTableSystem = input.string("Auto (Match Chart TF)", "Confluence Table Shows", options=["15m System", "30m System", "Auto (Match Chart TF)"], group=group_confluence)
+int i_pureMinConfluence = input.int(7, "Pure Madstrat Min Confluence", minval=1, maxval=11, group=group_confluence)
+bool i_useDynamicConfluence = input.bool(true, "Use Dynamic Confluence for Day 3", group=group_confluence)
+int i_day3MinConfluence = input.int(3, "Day 3 Min Confluence (if not dynamic)", minval=1, maxval=12, group=group_confluence)
+int i_confluenceBoost = input.int(0, "Confluence Boost (v10)", minval=0, maxval=5, step=1, group=group_confluence)
+bool i_requireEQRejection = input.bool(true, "Require EQ Rejection", group=group_confluence)
+int i_maxEQSignals = input.int(3, "Max Signals Per EQ Cycle", minval=1, maxval=10, group=group_confluence)
+int i_eqLookback15m = input.int(12, "EQ Rejection Lookback (15m bars)", minval=1, maxval=30, group=group_confluence)
+int i_eqLookback30m = input.int(6, "EQ Rejection Lookback (30m bars)", minval=1, maxval=20, group=group_confluence)
+string group_htf = "▸ HTF"
+int i_htfBaselineLookback1hr = input.int(4, "1hr Baseline Lookback (bars)", minval=1, maxval=20, group=group_htf)
+int i_htfEQLookback1hr = input.int(4, "1hr EQ Lookback (bars)", minval=1, maxval=20, group=group_htf)
+int i_htfBaselineLookback2hr = input.int(2, "2hr Baseline Lookback (bars)", minval=1, maxval=20, group=group_htf)
+int i_htfEQLookback2hr = input.int(2, "2hr EQ Lookback (bars)", minval=1, maxval=20, group=group_htf)
+bool i_requireHTFConfirmation = input.bool(true, "Require HTF Confirmation", group=group_htf)
+bool i_blockOnHTFRejection = input.bool(true, "Block on HTF EMA Rejection", group=group_htf)
+int i_htfRejectionLookback1hr = input.int(2, "1hr Rejection Lookback (bars)", minval=1, maxval=10, group=group_htf)
+int i_htfRejectionLookback2hr = input.int(1, "2hr Rejection Lookback (bars)", minval=1, maxval=10, group=group_htf)
+bool i_requireAllLevelsTouched = input.bool(false, "Require All Levels Touched", group=group_htf)
+string group_ltf = "▸ LTF"
+int i_ltf50EMALookback15m = input.int(5, "50 EMA Touch Lookback (15m)", minval=1, maxval=20, group=group_ltf)
+int i_ltf50EMALookback30m = input.int(3, "50 EMA Touch Lookback (30m)", minval=1, maxval=20, group=group_ltf)
+int i_ltf50SMALookback15m = input.int(5, "50 SMA Touch Lookback (15m)", minval=1, maxval=20, group=group_ltf)
+int i_ltf50SMALookback30m = input.int(3, "50 SMA Touch Lookback (30m)", minval=1, maxval=20, group=group_ltf)
+int i_ltf18EMALookback15m = input.int(3, "18 EMA Touch Lookback (15m)", minval=1, maxval=20, group=group_ltf)
+int i_ltf18EMALookback30m = input.int(2, "18 EMA Touch Lookback (30m)", minval=1, maxval=20, group=group_ltf)
+int i_ltf9EMALookback15m = input.int(2, "9 EMA Touch Lookback (15m)", minval=1, maxval=20, group=group_ltf)
+int i_ltf9EMALookback30m = input.int(1, "9 EMA Touch Lookback (30m)", minval=1, maxval=20, group=group_ltf)
+string group_signals = "Signal Types"
+bool i_showDay3 = input.bool(true, "Show Day 2/3 Madstrat Signals", group=group_signals)
+bool i_showPureMad = input.bool(true, "Show Pure Madstrat Signals", group=group_signals)
+int i_maxSignalsPerSession = input.int(5, "Max Signals Per Session", minval=1, maxval=20, group=group_signals)
+string group_session_filter = "Session Filter"
+bool i_enableSessionFilter = input.bool(false, "Enable Session Filter", group=group_session_filter)
+bool i_allowSydney = input.bool(true, "Allow Sydney Signals", group=group_session_filter, inline="sess1")
+bool i_allowAsian = input.bool(true, "Allow Asian Signals", group=group_session_filter, inline="sess1")
+bool i_allowLondon = input.bool(true, "Allow London Signals", group=group_session_filter, inline="sess2")
+bool i_allowNY = input.bool(true, "Allow NY Signals", group=group_session_filter, inline="sess2")
+bool i_enableOverlapConfluence = input.bool(true, "Enable Session Overlap Confluence (S2.1)", group=group_session_filter)
+bool i_enableKillzoneEntry = input.bool(true, "Killzone Entry Only", group=group_session_filter)
+int i_killzoneStartHour = input.int(8, "Killzone Start (ET)", minval=0, maxval=23, group=group_session_filter, inline="kz")
+int i_killzoneEndHour = input.int(12, "End", minval=0, maxval=23, group=group_session_filter, inline="kz")
+string group_session_boxes = "▸ Sessions"
+bool i_showSessionBoxes = input.bool(true, "Show Session Boxes", group=group_session_boxes)
+int i_sessionBoxCount = input.int(10, "Historical Sessions to Show", minval=5, maxval=50, group=group_session_boxes)
+bool i_sessionBoxLabels = input.bool(true, "Show Session Labels", group=group_session_boxes)
+string i_sessionLabelSize = input.string("tiny", "Label Size", options=["tiny", "small", "normal"], group=group_session_boxes)
+bool i_showSessionMidlines = input.bool(false, "Show Session Midlines", group=group_session_boxes)
+bool i_showSessionHL = input.bool(true, "Show Session H/L Lines", group=group_session_boxes)
+string i_sessionHLStyle = input.string("Dashed", "H/L Line Style", options=["Solid", "Dashed", "Dotted"], group=group_session_boxes)
+int i_sessionHLWidth = input.int(1, "H/L Line Width", minval=1, maxval=4, group=group_session_boxes)
+string group_sydney_box = "Sydney Session Box"
+bool i_showSydneyBox = input.bool(true, "Show Sydney", group=group_sydney_box, inline="syd1")
+color i_sydneyBoxColor = input.color(color.new(#9C27B0, 85), "Fill", group=group_sydney_box, inline="syd1")
+color i_sydneyBorderColor = input.color(color.new(#9C27B0, 40), "Border", group=group_sydney_box, inline="syd1")
+color i_sydneyHColor = input.color(color.new(#9C27B0, 30), "H Line", group=group_sydney_box, inline="syd_hl")
+color i_sydneyLColor = input.color(color.new(#9C27B0, 30), "L Line", group=group_sydney_box, inline="syd_hl")
+int i_sydneyStartHour = input.int(16, "Start Hour", minval=0, maxval=23, group=group_sydney_box, inline="syd2")
+int i_sydneyStartMin = input.int(0, "Min", minval=0, maxval=59, group=group_sydney_box, inline="syd2")
+int i_sydneyEndHour = input.int(1, "End Hour", minval=0, maxval=23, group=group_sydney_box, inline="syd3")
+int i_sydneyEndMin = input.int(0, "Min", minval=0, maxval=59, group=group_sydney_box, inline="syd3")
+string group_asian_box = "Asian Session Box"
+bool i_showAsianBox = input.bool(true, "Show Asian", group=group_asian_box, inline="asi1")
+color i_asianBoxColor = input.color(color.new(#F44336, 85), "Fill", group=group_asian_box, inline="asi1")
+color i_asianBorderColor = input.color(color.new(#F44336, 40), "Border", group=group_asian_box, inline="asi1")
+color i_asianHColor = input.color(color.new(#F44336, 30), "H Line", group=group_asian_box, inline="asi_hl")
+color i_asianLColor = input.color(color.new(#F44336, 30), "L Line", group=group_asian_box, inline="asi_hl")
+int i_asianStartHour = input.int(19, "Start Hour", minval=0, maxval=23, group=group_asian_box, inline="asi2")
+int i_asianStartMin = input.int(0, "Min", minval=0, maxval=59, group=group_asian_box, inline="asi2")
+int i_asianEndHour = input.int(4, "End Hour", minval=0, maxval=23, group=group_asian_box, inline="asi3")
+int i_asianEndMin = input.int(0, "Min", minval=0, maxval=59, group=group_asian_box, inline="asi3")
+string group_london_box = "London Session Box"
+bool i_showLondonBox = input.bool(true, "Show London", group=group_london_box, inline="lon1")
+color i_londonBoxColor = input.color(color.new(#4CAF50, 85), "Fill", group=group_london_box, inline="lon1")
+color i_londonBorderColor = input.color(color.new(#4CAF50, 40), "Border", group=group_london_box, inline="lon1")
+color i_londonHColor = input.color(color.new(#4CAF50, 30), "H Line", group=group_london_box, inline="lon_hl")
+color i_londonLColor = input.color(color.new(#4CAF50, 30), "L Line", group=group_london_box, inline="lon_hl")
+int i_londonStartHour = input.int(3, "Start Hour", minval=0, maxval=23, group=group_london_box, inline="lon2")
+int i_londonStartMin = input.int(0, "Min", minval=0, maxval=59, group=group_london_box, inline="lon2")
+int i_londonEndHour = input.int(11, "End Hour", minval=0, maxval=23, group=group_london_box, inline="lon3")
+int i_londonEndMin = input.int(0, "Min", minval=0, maxval=59, group=group_london_box, inline="lon3")
+string group_ny_box = "New York Session Box"
+bool i_showNYBox = input.bool(true, "Show New York", group=group_ny_box, inline="ny1")
+color i_nyBoxColor = input.color(color.new(#2196F3, 85), "Fill", group=group_ny_box, inline="ny1")
+color i_nyBorderColor = input.color(color.new(#2196F3, 40), "Border", group=group_ny_box, inline="ny1")
+color i_nyHColor = input.color(color.new(#2196F3, 30), "H Line", group=group_ny_box, inline="ny_hl")
+color i_nyLColor = input.color(color.new(#2196F3, 30), "L Line", group=group_ny_box, inline="ny_hl")
+int i_nyStartHour = input.int(8, "Start Hour", minval=0, maxval=23, group=group_ny_box, inline="ny2")
+int i_nyStartMin = input.int(0, "Min", minval=0, maxval=59, group=group_ny_box, inline="ny2")
+int i_nyEndHour = input.int(17, "End Hour", minval=0, maxval=23, group=group_ny_box, inline="ny3")
+int i_nyEndMin = input.int(0, "Min", minval=0, maxval=59, group=group_ny_box, inline="ny3")
+string group_killzones = "▸ Killzones"
+bool i_showKillzones = input.bool(true, "Show Killzone Highlights", group=group_killzones)
+int i_killzoneOpacity = input.int(92, "Background Opacity", minval=80, maxval=98, group=group_killzones)
+string group_kz_asian = "Asian Killzone"
+bool i_showKZ_Asian = input.bool(true, "Show Asian KZ", group=group_kz_asian, inline="kza1")
+color i_kzAsianColor = input.color(color.new(#FF5722, 92), "Color", group=group_kz_asian, inline="kza1")
+int i_kzAsianStartHour = input.int(20, "Start", minval=0, maxval=23, group=group_kz_asian, inline="kza2")
+int i_kzAsianStartMin = input.int(0, ":", minval=0, maxval=59, group=group_kz_asian, inline="kza2")
+int i_kzAsianEndHour = input.int(0, "End", minval=0, maxval=23, group=group_kz_asian, inline="kza2")
+int i_kzAsianEndMin = input.int(0, ":", minval=0, maxval=59, group=group_kz_asian, inline="kza2")
+string group_kz_london = "London Killzone"
+bool i_showKZ_London = input.bool(true, "Show London KZ", group=group_kz_london, inline="kzl1")
+color i_kzLondonColor = input.color(color.new(#4CAF50, 92), "Color", group=group_kz_london, inline="kzl1")
+int i_kzLondonStartHour = input.int(2, "Start", minval=0, maxval=23, group=group_kz_london, inline="kzl2")
+int i_kzLondonStartMin = input.int(0, ":", minval=0, maxval=59, group=group_kz_london, inline="kzl2")
+int i_kzLondonEndHour = input.int(5, "End", minval=0, maxval=23, group=group_kz_london, inline="kzl2")
+int i_kzLondonEndMin = input.int(0, ":", minval=0, maxval=59, group=group_kz_london, inline="kzl2")
+string group_kz_ny = "New York Killzone"
+bool i_showKZ_NY = input.bool(true, "Show NY KZ", group=group_kz_ny, inline="kzn1")
+color i_kzNYColor = input.color(color.new(#2196F3, 92), "Color", group=group_kz_ny, inline="kzn1")
+int i_kzNYStartHour = input.int(7, "Start", minval=0, maxval=23, group=group_kz_ny, inline="kzn2")
+int i_kzNYStartMin = input.int(0, ":", minval=0, maxval=59, group=group_kz_ny, inline="kzn2")
+int i_kzNYEndHour = input.int(10, "End", minval=0, maxval=23, group=group_kz_ny, inline="kzn2")
+int i_kzNYEndMin = input.int(0, ":", minval=0, maxval=59, group=group_kz_ny, inline="kzn2")
+string group_kz_lc = "London Close Killzone"
+bool i_showKZ_LondonClose = input.bool(true, "Show London Close KZ", group=group_kz_lc, inline="kzlc1")
+color i_kzLondonCloseColor = input.color(color.new(#9C27B0, 92), "Color", group=group_kz_lc, inline="kzlc1")
+int i_kzLCStartHour = input.int(10, "Start", minval=0, maxval=23, group=group_kz_lc, inline="kzlc2")
+int i_kzLCStartMin = input.int(0, ":", minval=0, maxval=59, group=group_kz_lc, inline="kzlc2")
+int i_kzLCEndHour = input.int(12, "End", minval=0, maxval=23, group=group_kz_lc, inline="kzlc2")
+int i_kzLCEndMin = input.int(0, ":", minval=0, maxval=59, group=group_kz_lc, inline="kzlc2")
+string group_adr = "▸ ADR Levels"
+bool i_showADR = input.bool(true, "Show ADR Levels", group=group_adr)
+int i_adrPeriod = input.int(14, "ADR Lookback (Days)", minval=5, maxval=50, group=group_adr)
+string i_adrAnchor = input.string("Daily Open", "ADR Anchor Point", options=["Daily Open", "Previous Close", "Midnight Open"], group=group_adr)
+bool i_showADRMidline = input.bool(true, "Show ADR Mid-Line", group=group_adr)
+bool i_showADRFill = input.bool(false, "Show ADR Zone Fill", group=group_adr)
+bool i_showADRLabels = input.bool(true, "Show ADR Labels", group=group_adr)
+color i_adrUpperColor = input.color(color.new(color.red, 30), "Upper ADR Color", group=group_adr, inline="adr_col")
+color i_adrLowerColor = input.color(color.new(color.green, 30), "Lower ADR Color", group=group_adr, inline="adr_col")
+color i_adrMidColor = input.color(color.new(color.gray, 30), "Mid-Line Color", group=group_adr, inline="adr_col2")
+color i_adrFillColor = input.color(color.new(color.yellow, 90), "Fill Color", group=group_adr, inline="adr_col2")
+int i_adrLineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=group_adr)
+string i_adrLineStyle = input.string("Dashed", "Line Style", options=["Solid", "Dashed", "Dotted"], group=group_adr)
+bool i_extendADRLines = input.bool(true, "Extend Lines Right", group=group_adr)
+bool i_showADRHitMarker = input.bool(true, "Mark ADR Hits", group=group_adr)
+bool i_enableADRFilter = input.bool(false, "Enable ADR Exhaustion Filter (S2.2)", group=group_adr)
+float i_adrFilterThreshold = input.float(80.0, "ADR Filter Threshold (%)", minval=50.0, maxval=120.0, step=5.0, group=group_adr)
+string group_visual = "Visual Settings"
+bool i_showGoldenWindow = input.bool(true, "Show Golden Window", group=group_visual)
+bool i_showChartMAs = input.bool(true, "Show Chart Moving Averages", group=group_visual)
+string group_daily_session = "Daily Session Definition"
+string i_instrumentPreset = input.string("Forex (FX Pairs)", "Instrument Preset", options=["Forex (FX Pairs)", "Metals (XAU/XAG)", "Custom"], group=group_daily_session)
+int i_rolloverHour_custom = input.int(17, "Custom: Rollover Hour (0-23)", minval=0, maxval=23, group=group_daily_session)
+string i_rolloverTimezone_custom = input.string("America/New_York", "Custom: Timezone", group=group_daily_session)
+int i_sundayOpenHour_custom = input.int(17, "Custom: Sunday Open Hour", minval=0, maxval=23, group=group_daily_session)
+int i_sundayOpenMinute_custom = input.int(5, "Minute", minval=0, maxval=59, group=group_daily_session)
+int i_fridayCloseHour_custom = input.int(16, "Custom: Friday Close Hour", minval=0, maxval=23, group=group_daily_session)
+int i_fridayCloseMinute_custom = input.int(59, "Minute", minval=0, maxval=59, group=group_daily_session)
+bool i_showSessionBreakLine = input.bool(true, "Show Session Break Lines", group=group_daily_session)
+color i_sessionBreakColor = input.color(color.black, "Session Break Color", group=group_daily_session)
+int i_sessionBreakWidth = input.int(2, "Width", minval=1, maxval=5, group=group_daily_session)
+string i_rolloverTimezone = i_instrumentPreset == "Custom" ? i_rolloverTimezone_custom : "America/New_York"
+int i_rolloverHour = i_instrumentPreset == "Custom" ? i_rolloverHour_custom : 17
+int i_sundayOpenHour = i_instrumentPreset == "Forex (FX Pairs)" ? 17 : i_instrumentPreset == "Metals (XAU/XAG)" ? 18 : i_sundayOpenHour_custom
+int i_sundayOpenMinute = i_instrumentPreset == "Metals (XAU/XAG)" ? 0 : i_instrumentPreset == "Custom" ? i_sundayOpenMinute_custom : 5
+int i_fridayCloseHour = i_instrumentPreset == "Custom" ? i_fridayCloseHour_custom : 16
+int i_fridayCloseMinute = i_instrumentPreset == "Custom" ? i_fridayCloseMinute_custom : 59
+string group_day_labels = "Day Labels"
+int i_maxLabels = input.int(60, "Max Historical Labels", minval=10, maxval=200, group=group_day_labels)
+bool i_showDayLabels = input.bool(true, "Show Day of Week Labels", group=group_day_labels)
+string i_dayLabelPosition = input.string("top", "DOW Label Position", options=["top", "bottom"], group=group_day_labels)
+int i_dayLabelHour = input.int(6, "DOW Label Hour (0-23)", minval=0, maxval=23, group=group_day_labels)
+color i_dowLabelTextColor = input.color(color.black, "DOW Label Text Color", group=group_day_labels)
+color i_gsdLabelColor = input.color(color.new(color.blue, 25), "GSD Label BG", group=group_day_labels)
+color i_gsdLabelTextColor = input.color(color.white, "Text", group=group_day_labels)
+color i_rsdLabelColor = input.color(color.new(color.red, 25), "RSD Label BG", group=group_day_labels)
+color i_rsdLabelTextColor = input.color(color.white, "Text", group=group_day_labels)
+color i_insideLabelColor = input.color(color.new(color.gray, 25), "Inside Day BG", group=group_day_labels)
+color i_insideLabelTextColor = input.color(color.white, "Text", group=group_day_labels)
+color i_bullBreakoutColor = input.color(color.new(color.blue, 25), "Bull Breakout BG", group=group_day_labels)
+color i_bullBreakoutTextColor = input.color(color.white, "Text", group=group_day_labels)
+color i_bearBreakoutColor = input.color(color.new(color.red, 25), "Bear Breakout BG", group=group_day_labels)
+color i_bearBreakoutTextColor = input.color(color.white, "Text", group=group_day_labels)
+string group_daily = "Daily Levels"
+bool i_showPDH = input.bool(true, "Show PDH", group=group_daily)
+color i_pdhColor = input.color(color.blue, "", group=group_daily)
+int i_pdhWidth = input.int(2, "Width", minval=1, maxval=4, group=group_daily)
+bool i_showPDL = input.bool(true, "Show PDL", group=group_daily)
+color i_pdlColor = input.color(color.green, "", group=group_daily)
+int i_pdlWidth = input.int(2, "Width", minval=1, maxval=4, group=group_daily)
+bool i_showPDEQ = input.bool(true, "Show PD-EQ", group=group_daily)
+color i_pdeqColor = input.color(color.black, "", group=group_daily)
+int i_pdeqWidth = input.int(3, "Width", minval=1, maxval=4, group=group_daily)
+bool i_showPDO = input.bool(false, "Show PDO (Open)", group=group_daily)
+color i_pdoColor = input.color(color.orange, "", group=group_daily)
+int i_pdoWidth = input.int(1, "Width", minval=1, maxval=4, group=group_daily)
+bool i_showPDC = input.bool(false, "Show PDC (Close)", group=group_daily)
+color i_pdcColor = input.color(color.purple, "", group=group_daily)
+int i_pdcWidth = input.int(1, "Width", minval=1, maxval=4, group=group_daily)
+bool i_showPDBodyHigh = input.bool(false, "Show PD Body High", group=group_daily)
+color i_pdBodyHighColor = input.color(color.new(color.blue, 50), "", group=group_daily)
+int i_pdBodyHighWidth = input.int(1, "Width", minval=1, maxval=4, group=group_daily)
+bool i_showPDBodyLow = input.bool(false, "Show PD Body Low", group=group_daily)
+color i_pdBodyLowColor = input.color(color.new(color.green, 50), "", group=group_daily)
+int i_pdBodyLowWidth = input.int(1, "Width", minval=1, maxval=4, group=group_daily)
+string group_exhaustion = "▸ Exhaustion"
+bool i_showExhaustionAreas = input.bool(true, "Show Exhaustion Areas", group=group_exhaustion)
+bool i_showSessionExhaustion = input.bool(true, "Show Session H/L Exhaustion", group=group_exhaustion)
+bool i_showAsiaExhaustion    = input.bool(true, "  ├─ Asian Session Zones", group=group_exhaustion)
+bool i_showLondonExhaustion  = input.bool(true, "  ├─ London Session Zones", group=group_exhaustion)
+bool i_showNYExhaustion      = input.bool(true, "  └─ NY Session Zones", group=group_exhaustion)
+bool i_showFirstHourExhaustion = input.bool(false, "Show First Hour Exhaustion", group=group_exhaustion)
+bool i_showCandleExhaustion = input.bool(true, "Show Candle Absorption Zones", group=group_exhaustion)
+color i_exhaustionBullColor = input.color(color.new(color.green, 70), "Bull Exhaustion", group=group_exhaustion)
+color i_exhaustionBearColor = input.color(color.new(color.red, 70), "Bear Exhaustion", group=group_exhaustion)
+int i_maxExhaustionZones = input.int(10, "Max Session Zones", minval=3, maxval=20, group=group_exhaustion)
+int i_exhaustionBorderWidth = input.int(2, "Border Width", minval=1, maxval=4, group=group_exhaustion)
+int i_exhaustionBorderOpacity = input.int(30, "Border Opacity", minval=0, maxval=100, group=group_exhaustion)
+bool i_useCustomBorderColor = input.bool(false, "Use Custom Border Colors", group=group_exhaustion)
+color i_exhaustionBullBorder = input.color(color.new(color.green, 30), "Bull Border", group=group_exhaustion)
+color i_exhaustionBearBorder = input.color(color.new(color.red, 30), "Bear Border", group=group_exhaustion)
+string group_exhaustion_cascade = "▸ Exhaust Cascade"
+bool i_enableCascadeRefinement = input.bool(true, "Enable Cascade Refinement", group=group_exhaustion_cascade)
+bool i_showHTFContext = input.bool(false, "Show HTF Context Zones", group=group_exhaustion_cascade)
+int i_htfContextOpacity = input.int(85, "HTF Context Opacity", minval=50, maxval=95, group=group_exhaustion_cascade)
+string i_exhaustionDisplayTF = input.string("Auto (Match Signal TF)", "Display Zones From", options=["Auto (Match Signal TF)", "15m Only", "30m Only", "H1 Only", "H4 Only", "All Levels"], group=group_exhaustion_cascade)
+bool i_terminateAtRollover = input.bool(true, "Terminate at Daily Rollover", group=group_exhaustion_cascade)
+string group_weekly = "Weekly Levels"
+bool i_showWeeklyLevels = input.bool(true, "Show Weekly Levels", group=group_weekly)
+bool i_showPrevWeek = input.bool(true, "Show Previous Week", group=group_weekly)
+color i_prevWeekColor = input.color(color.black, "Previous Week Color", group=group_weekly)
+int i_prevWeekWidth = input.int(2, "Previous Week Width", minval=1, maxval=4, group=group_weekly)
+color i_pweqLineColor = input.color(color.black, "Previous Week EQ Color", group=group_weekly)
+int i_pweqLineWidth = input.int(1, "Previous Week EQ Width", minval=1, maxval=4, group=group_weekly)
+bool i_showCurrWeek = input.bool(true, "Show Current Week", group=group_weekly)
+color i_currWeekColor = input.color(color.blue, "Current Week Color", group=group_weekly)
+int i_currWeekWidth = input.int(2, "Current Week Width", minval=1, maxval=4, group=group_weekly)
+bool i_showWeeklyLabels = input.bool(true, "Show Weekly Labels", group=group_weekly)
+string i_weeklyLabelSize = input.string("normal", "Weekly Label Size", options=["tiny", "small", "normal", "large", "huge"], group=group_weekly)
+color i_weeklyLabelColor = input.color(color.black, "Weekly Label Text Color", group=group_weekly)
+string i_weeklyLevelEndDay = input.string("Friday", "Lines & Labels End Day", options=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Current Day", "Current Day + 1"], group=group_weekly)
+string group_mas = "Moving Averages"
+color i_ema9Color = input.color(color.red, "9 EMA", group=group_mas)
+int i_ema9Width = input.int(2, "Width", minval=1, maxval=4, group=group_mas)
+color i_ema18Color = input.color(color.blue, "18 EMA", group=group_mas)
+int i_ema18Width = input.int(2, "Width", minval=1, maxval=4, group=group_mas)
+color i_ema50Color = input.color(color.yellow, "50 EMA", group=group_mas)
+int i_ema50Width = input.int(3, "Width", minval=1, maxval=4, group=group_mas)
+color i_sma50Color = input.color(color.white, "50 SMA", group=group_mas)
+int i_sma50Width = input.int(1, "Width", minval=1, maxval=4, group=group_mas)
+string group_sig_colors = "Signal Colors"
+color i_d3Buy15mColor = input.color(color.blue, "Day 3 Buy (15m)", group=group_sig_colors)
+color i_d3Sell15mColor = input.color(color.red, "Sell", group=group_sig_colors)
+color i_d3Buy30mColor = input.color(color.teal, "Day 3 Buy (30m)", group=group_sig_colors)
+color i_d3Sell30mColor = input.color(color.orange, "Sell", group=group_sig_colors)
+color i_madBuy15mColor = input.color(color.aqua, "Pure MAD Buy (15m)", group=group_sig_colors)
+color i_madSell15mColor = input.color(color.fuchsia, "Sell", group=group_sig_colors)
+color i_madBuy30mColor = input.color(color.lime, "Pure MAD Buy (30m)", group=group_sig_colors)
+color i_madSell30mColor = input.color(color.maroon, "Sell", group=group_sig_colors)
+string group_table_display = "Table Display"
+string i_tableMode = input.string("Full", "Table Display Mode", options=["Full", "Compact", "Status Only", "Confluence Only", "Hidden"], group=group_table_display)
+string i_tableTextSize = input.string("small", "Table Text Size", options=["tiny", "small", "normal", "large"], group=group_table_display)
+string GRP_ALT = "▸ Alert Settings"
+bool i_enableSignalAlerts = input.bool(true, "Enable Signal Alerts", group=GRP_ALT)
+bool i_alertDay2Signals   = input.bool(true, "  └─ Day 2 Alerts", group=GRP_ALT)
+bool i_alertDay3Signals   = input.bool(true, "  └─ Day 3 Alerts", group=GRP_ALT)
+bool i_alertPureSignals   = input.bool(true, "  └─ Pure MAD Alerts", group=GRP_ALT)
+bool i_enableExitAlerts   = input.bool(true, "Enable Exit Alerts", group=GRP_ALT)
+string GRP_DAY_ALT = "▸ Day Classification Alerts"
+bool i_enableDayAlerts    = input.bool(false, "Enable Day Classification Alerts", group=GRP_DAY_ALT)
+string GRP_BL = "▸ Baseline Touch Alerts"
+string i_blAlertMode = input.string("Exact Touch", "Alert Sensitivity", options=["Exact Touch", "1 pip", "3 pips", "5 pips", "Custom", "Zone (Entry)"], group=GRP_BL)
+float i_blAlertCustomPips = input.float(1.0, "  └─ Custom Pips", minval=0.0, maxval=50.0, step=0.5, group=GRP_BL)
+bool i_alertHTFBaseline   = input.bool(true, "Enable HTF Baseline Alerts", group=GRP_BL)
+bool i_alert1hrBaseline   = input.bool(true, "  └─ 1hr Baseline", group=GRP_BL)
+bool i_alert2hrBaseline   = input.bool(true, "  └─ 2hr Baseline", group=GRP_BL)
+bool i_alertLTFBaseline   = input.bool(true, "Enable LTF Baseline Alerts", group=GRP_BL)
+bool i_alert15mBaseline   = input.bool(true, "  └─ 15m Baseline", group=GRP_BL)
+bool i_alert30mBaseline   = input.bool(true, "  └─ 30m Baseline", group=GRP_BL)
+
+// ═══════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 3: HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════
+
+f_pip_value() =>
+    bool is_jpy = str.contains(syminfo.ticker, "JPY")
+    bool is_metal = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "XAG") or str.contains(syminfo.ticker, "GOLD")
+    float pip = is_jpy ? 0.01 : is_metal ? 0.1 : 0.0001
+    pip
+
+f_line_style(_style) =>
+    _style == "Solid" ? line.style_solid : _style == "Dashed" ? line.style_dashed : line.style_dotted
+
+f_label_size(_size) =>
+    _size == "tiny" ? size.tiny : _size == "small" ? size.small : _size == "normal" ? size.normal : _size == "large" ? size.large : size.huge
+
+f_in_session(_h_start, _m_start, _h_end, _m_end) =>
+    int cur_h = hour(time, tz_effective)
+    int cur_m = minute(time, tz_effective)
+    int cur_mins = cur_h * 60 + cur_m
+    int start_mins = _h_start * 60 + _m_start
+    int end_mins = _h_end * 60 + _m_end
+    bool result = false
+    if start_mins < end_mins
+        result := cur_mins >= start_mins and cur_mins < end_mins
+    else
+        result := cur_mins >= start_mins or cur_mins < end_mins
+    result
+
+f_in_killzone() =>
+    bool in_kz = false
+    if i_enableKillzoneEntry
+        int h = hour(time, tz_effective)
+        in_kz := h >= i_killzoneStartHour and h < i_killzoneEndHour
+    else
+        in_kz := true
+    in_kz
+
+// FIX #10: Consolidated exhaustion zone search (replaces 4 duplicate functions)
+f_find_exhaustion_zone(_entry, _is_long, _zones_top, _zones_bot, _zones_active, _max_zones, _skip_first) =>
+    float result = na
+    int found_count = 0
+    for i = 0 to _max_zones - 1
+        if i < array.size(_zones_top) and i < array.size(_zones_bot) and i < array.size(_zones_active)
+            if array.get(_zones_active, i)
+                float zt = array.get(_zones_top, i)
+                float zb = array.get(_zones_bot, i)
+                bool valid = false
+                if _is_long
+                    valid := zb < _entry and zb > _entry - 500 * f_pip_value()
+                else
+                    valid := zt > _entry and zt < _entry + 500 * f_pip_value()
+                if valid
+                    found_count += 1
+                    if found_count > _skip_first
+                        result := _is_long ? zb : zt
+                        break
+    result
+
+// Instrument detection
+bool is_gold = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "XAG") or str.contains(syminfo.ticker, "GOLD")
+bool is_forex = not is_gold
+string detected_type = i_instrumentType == "Auto-Detect" ? (is_gold ? "Gold/Metals" : "Forex") : i_instrumentType
+float pip_val = f_pip_value()
+float spread_value = i_spreadPips * pip_val
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 4: INDICATORS & SECURITY CALLS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Chart-level EMAs
+float ema9  = ta.ema(close, 9)
+float ema18 = ta.ema(close, 18)
+float ema50 = ta.ema(close, 50)
+float sma50 = ta.sma(close, 50)
+
+// ATR for trailing stops
+float trail_atr = ta.atr(i_trailAtrPeriod)
+
+// HTF data fetch function (single call per timeframe)
+f_get_htf_data() =>
+    [open, high, low, close, ta.ema(close, 9), ta.ema(close, 18), ta.ema(close, 50), ta.sma(close, 50)]
+
+// Security calls - each timeframe called ONCE (FIX #1/#12: eliminated duplicates)
+[htf_4hr_o, htf_4hr_h, htf_4hr_l, htf_4hr_c, htf_4hr_ema9, htf_4hr_ema18, htf_4hr_ema50, htf_4hr_sma50] = request.security(syminfo.tickerid, "240", f_get_htf_data(), lookahead=barmerge.lookahead_off)
+[htf_2hr_o, htf_2hr_h, htf_2hr_l, htf_2hr_c, htf_2hr_ema9, htf_2hr_ema18, htf_2hr_ema50, htf_2hr_sma50] = request.security(syminfo.tickerid, "120", f_get_htf_data(), lookahead=barmerge.lookahead_off)
+[htf_1hr_o, htf_1hr_h, htf_1hr_l, htf_1hr_c, htf_1hr_ema9, htf_1hr_ema18, htf_1hr_ema50, htf_1hr_sma50] = request.security(syminfo.tickerid, "60", f_get_htf_data(), lookahead=barmerge.lookahead_off)
+[ltf_30m_o, ltf_30m_h, ltf_30m_l, ltf_30m_c, ltf_30m_ema9, ltf_30m_ema18, ltf_30m_ema50, ltf_30m_sma50] = request.security(syminfo.tickerid, "30", f_get_htf_data(), lookahead=barmerge.lookahead_off)
+[ltf_15m_o, ltf_15m_h, ltf_15m_l, ltf_15m_c, ltf_15m_ema9, ltf_15m_ema18, ltf_15m_ema50, ltf_15m_sma50] = request.security(syminfo.tickerid, "15", f_get_htf_data(), lookahead=barmerge.lookahead_off)
+[htf_12hr_o, htf_12hr_h, htf_12hr_l, htf_12hr_c, htf_12hr_ema9, htf_12hr_ema18, htf_12hr_ema50, htf_12hr_sma50] = request.security(syminfo.tickerid, "720", f_get_htf_data(), lookahead=barmerge.lookahead_off)
+
+// Daily data
+[daily_o, daily_h, daily_l, daily_c, daily_ema9, daily_ema18, daily_ema50, daily_sma50] = request.security(syminfo.tickerid, "D", f_get_htf_data(), lookahead=barmerge.lookahead_off)
+
+// FIX #1/#12: Derive cascade [1] data from existing HTF calls (no duplicate security calls)
+float h4_o = htf_4hr_o,   float h4_h = htf_4hr_h,   float h4_l = htf_4hr_l,   float h4_c = htf_4hr_c
+float h4_o1 = htf_4hr_o[1], float h4_h1 = htf_4hr_h[1], float h4_l1 = htf_4hr_l[1], float h4_c1 = htf_4hr_c[1]
+float h1_o = htf_1hr_o,   float h1_h = htf_1hr_h,   float h1_l = htf_1hr_l,   float h1_c = htf_1hr_c
+float h1_o1 = htf_1hr_o[1], float h1_h1 = htf_1hr_h[1], float h1_l1 = htf_1hr_l[1], float h1_c1 = htf_1hr_c[1]
+float m30_o = ltf_30m_o,   float m30_h = ltf_30m_h,   float m30_l = ltf_30m_l,   float m30_c = ltf_30m_c
+float m30_o1 = ltf_30m_o[1], float m30_h1 = ltf_30m_h[1], float m30_l1 = ltf_30m_l[1], float m30_c1 = ltf_30m_c[1]
+float m15_o = ltf_15m_o,   float m15_h = ltf_15m_h,   float m15_l = ltf_15m_l,   float m15_c = ltf_15m_c
+float m15_o1 = ltf_15m_o[1], float m15_h1 = ltf_15m_h[1], float m15_l1 = ltf_15m_l[1], float m15_c1 = ltf_15m_c[1]
+
+// Weekly data
+[weekly_o, weekly_h, weekly_l, weekly_c] = request.security(syminfo.tickerid, "W", [open, high, low, close], lookahead=barmerge.lookahead_off)
+
+// Effective EMAs for entry timeframe
+float eff_15m_ema9  = ltf_15m_ema9
+float eff_15m_ema18 = ltf_15m_ema18
+float eff_15m_ema50 = ltf_15m_ema50
+float eff_15m_sma50 = ltf_15m_sma50
+float eff_30m_ema9  = ltf_30m_ema9
+float eff_30m_ema18 = ltf_30m_ema18
+float eff_30m_ema50 = ltf_30m_ema50
+float eff_30m_sma50 = ltf_30m_sma50
+
+// HTF trend filter (v10)
+bool htf_trend_bull = true
+bool htf_trend_bear = true
+if i_htfTrendMode == "Daily 50 EMA"
+    htf_trend_bull := daily_c > daily_ema50
+    htf_trend_bear := daily_c < daily_ema50
+else if i_htfTrendMode == "Daily EMA Stack"
+    htf_trend_bull := daily_ema9 > daily_ema18 and daily_ema18 > daily_ema50
+    htf_trend_bear := daily_ema9 < daily_ema18 and daily_ema18 < daily_ema50
+else if i_htfTrendMode == "H4 EMA"
+    htf_trend_bull := htf_4hr_c > htf_4hr_ema50
+    htf_trend_bear := htf_4hr_c < htf_4hr_ema50
+else if i_htfTrendMode == "Daily + H4"
+    htf_trend_bull := daily_c > daily_ema50 and htf_4hr_c > htf_4hr_ema50
+    htf_trend_bear := daily_c < daily_ema50 and htf_4hr_c < htf_4hr_ema50
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 5: 5-MINUTE AUTHORITATIVE DAY ENGINE (FIX #6: _5m_ prefixed locals)
+// ═══════════════════════════════════════════════════════════════════════
+
+f_day_state_5m() =>
+    // FIX #6: All locals prefixed with _5m_ to avoid shadowing chart-level vars
+    var float _5m_pdh = na
+    var float _5m_pdl = na
+    var float _5m_pdo = na
+    var float _5m_pdc = na
+    var float _5m_pd_body_high = na
+    var float _5m_pd_body_low = na
+    var float _5m_cdh = na
+    var float _5m_cdl = na
+    var float _5m_cdo = na
+    var float _5m_prev_week_high = na
+    var float _5m_prev_week_low = na
+    var float _5m_curr_week_high = na
+    var float _5m_curr_week_low = na
+    var float _5m_curr_week_open = na
+    var int _5m_day_count = 0
+    var int _5m_prefix = PREFIX_NONE
+    var int _5m_gsd_count = 0
+    var int _5m_rsd_count = 0
+    var int _5m_dlabel = DLABEL_NORMAL
+    var bool _5m_inside_day_freeze = false
+    var int _5m_rollover_hour = 17
+    
+    // Check rollover
+    int _5m_h = hour(time, "America/New_York")
+    int _5m_h_prev = hour(time[1], "America/New_York")
+    bool _5m_is_rollover = _5m_h >= _5m_rollover_hour and _5m_h_prev < _5m_rollover_hour
+    int _5m_dow = dayofweek(time, "America/New_York")
+    bool _5m_is_sunday = _5m_dow == dayofweek.sunday
+    bool _5m_is_monday = _5m_dow == dayofweek.monday
+    
+    // Weekly rollover
+    if _5m_is_monday and _5m_is_rollover
+        _5m_prev_week_high := _5m_curr_week_high
+        _5m_prev_week_low := _5m_curr_week_low
+        _5m_curr_week_high := high
+        _5m_curr_week_low := low
+        _5m_curr_week_open := open
+    else
+        if not na(_5m_curr_week_high)
+            _5m_curr_week_high := math.max(_5m_curr_week_high, high)
+        if not na(_5m_curr_week_low)
+            _5m_curr_week_low := math.min(_5m_curr_week_low, low)
+    
+    if _5m_is_rollover and not _5m_is_sunday
+        // Save previous day data
+        _5m_pdh := _5m_cdh
+        _5m_pdl := _5m_cdl
+        _5m_pdo := _5m_cdo
+        _5m_pdc := close[1]
+        _5m_pd_body_high := math.max(_5m_cdo, close[1])
+        _5m_pd_body_low := math.min(_5m_cdo, close[1])
+        
+        // Reset current day
+        _5m_cdh := high
+        _5m_cdl := low
+        _5m_cdo := open
+        
+        // Day classification
+        float _5m_prev_range = _5m_pdh - _5m_pdl
+        bool _5m_is_green = _5m_pdc > _5m_pdo
+        bool _5m_is_red = _5m_pdc < _5m_pdo
+        
+        // Inside day check
+        bool _5m_is_inside = not na(_5m_pdh[1]) and _5m_pdh < nz(_5m_pdh[1]) and _5m_pdl > nz(_5m_pdl[1])
+        
+        if _5m_is_inside
+            _5m_dlabel := DLABEL_INSIDE
+            // FIX #11: Inside Day Continuation mode
+            if i_enableInsideDayCont and _5m_prefix != PREFIX_NONE
+                _5m_dlabel := DLABEL_INSIDE_CONT
+                _5m_inside_day_freeze := false
+            else
+                _5m_inside_day_freeze := true
+        else
+            _5m_inside_day_freeze := false
+            // Clean breakout check
+            bool _5m_broke_high = _5m_pdh > nz(_5m_pdh[1])
+            bool _5m_broke_low = _5m_pdl < nz(_5m_pdl[1])
+            
+            if _5m_broke_high and not _5m_broke_low and _5m_is_green
+                _5m_dlabel := DLABEL_CLEAN_BULL
+            else if _5m_broke_low and not _5m_broke_high and _5m_is_red
+                _5m_dlabel := DLABEL_CLEAN_BEAR
+            else
+                // FBR check
+                bool _5m_fbr_bull = _5m_is_red and _5m_pdc > _5m_pdl + _5m_prev_range * 0.5
+                bool _5m_fbr_bear = _5m_is_green and _5m_pdc < _5m_pdh - _5m_prev_range * 0.5
+                
+                if _5m_fbr_bull
+                    _5m_dlabel := DLABEL_FBR_BULL
+                else if _5m_fbr_bear
+                    _5m_dlabel := DLABEL_FBR_BEAR
+                else
+                    _5m_dlabel := DLABEL_NORMAL
+            
+            // Setup day logic (GSD/RSD counting)
+            if _5m_is_green
+                if _5m_gsd_count >= 0
+                    _5m_gsd_count += 1
+                else
+                    _5m_gsd_count := 1
+                _5m_rsd_count := 0
+                _5m_prefix := PREFIX_GSD
+            else if _5m_is_red
+                if _5m_rsd_count >= 0
+                    _5m_rsd_count += 1
+                else
+                    _5m_rsd_count := 1
+                _5m_gsd_count := 0
+                _5m_prefix := PREFIX_RSD
+            
+            _5m_day_count += 1
+    else
+        // Intraday tracking
+        if not na(_5m_cdh)
+            _5m_cdh := math.max(_5m_cdh, high)
+        else
+            _5m_cdh := high
+        if not na(_5m_cdl)
+            _5m_cdl := math.min(_5m_cdl, low)
+        else
+            _5m_cdl := low
+        if na(_5m_cdo)
+            _5m_cdo := open
+    
+    [_5m_pdh, _5m_pdl, _5m_pdo, _5m_pdc, _5m_pd_body_high, _5m_pd_body_low,
+     _5m_cdh, _5m_cdl, _5m_cdo, _5m_prev_week_high, _5m_prev_week_low,
+     _5m_curr_week_high, _5m_curr_week_low, _5m_curr_week_open,
+     _5m_day_count, _5m_prefix, _5m_gsd_count, _5m_rsd_count, _5m_dlabel,
+     _5m_inside_day_freeze]
+
+// 5m security call
+[pdh5, pdl5, pdo5, pdc5, pd_bh5, pd_bl5,
+ cdh5, cdl5, cdo5, pwh5, pwl5,
+ cwh5, cwl5, cwo5,
+ dc5, prefix5, gsd5, rsd5, dl5, idf5] = request.security(syminfo.tickerid, "5", f_day_state_5m(), lookahead=barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 6: CHART-LEVEL DAY CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Chart-level day state variables (authoritative from 5m engine)
+var float pdh = na, var float pdl = na, var float pdo = na, var float pdc = na
+var float pd_body_high = na, var float pd_body_low = na
+var float cdh = na, var float cdl = na, var float cdo = na
+var float prev_week_high = na, var float prev_week_low = na
+var float curr_week_high = na, var float curr_week_low = na
+var float curr_week_open = na
+var int day_count = 0
+var int current_prefix = PREFIX_NONE
+var int gsd_count = 0, var int rsd_count = 0
+var int day_label_type = DLABEL_NORMAL
+var bool inside_day_freeze = false
+var int current_week_start_time = na
+
+// Rollover detection on chart TF
+int chart_h = hour(time, i_rolloverTimezone)
+int chart_h_prev = hour(time[1], i_rolloverTimezone)
+bool is_rollover = chart_h >= i_rolloverHour and chart_h_prev < i_rolloverHour
+int chart_dow = dayofweek(time, i_rolloverTimezone)
+bool is_sunday = chart_dow == dayofweek.sunday
+bool is_friday = chart_dow == dayofweek.friday
+bool is_monday = chart_dow == dayofweek.monday
+
+// Adopt 5m authoritative values
+if not na(pdh5)
+    pdh := pdh5
+    pdl := pdl5
+    pdo := pdo5
+    pdc := pdc5
+    pd_body_high := pd_bh5
+    pd_body_low := pd_bl5
+if not na(cdh5)
+    cdh := cdh5
+    cdl := cdl5
+    cdo := cdo5
+if not na(pwh5)
+    prev_week_high := pwh5
+    prev_week_low := pwl5
+if not na(cwh5)
+    curr_week_high := cwh5
+    curr_week_low := cwl5
+    curr_week_open := cwo5
+if not na(prefix5)
+    current_prefix := math.round(prefix5)
+    gsd_count := math.round(gsd5)
+    rsd_count := math.round(rsd5)
+    day_label_type := math.round(dl5)
+    day_count := math.round(dc5)
+    inside_day_freeze := idf5 != 0
+
+// Weekly tracking
+if is_monday and is_rollover
+    current_week_start_time := time
+
+// Derived daily levels
+float pdeq = not na(pdh) and not na(pdl) ? (pdh + pdl) / 2.0 : na
+float cd_range = not na(cdh) and not na(cdl) ? cdh - cdl : na
+
+// Previous week EQ
+float pweq = not na(prev_week_high) and not na(prev_week_low) ? (prev_week_high + prev_week_low) / 2.0 : na
+float curr_week_eq = not na(curr_week_high) and not na(curr_week_low) ? (curr_week_high + curr_week_low) / 2.0 : na
+
+// Day type flags
+bool is_gsd = current_prefix == PREFIX_GSD
+bool is_rsd = current_prefix == PREFIX_RSD
+int setup_day_num = is_gsd ? gsd_count : is_rsd ? rsd_count : 0
+bool is_day2 = setup_day_num == 2
+bool is_day3 = setup_day_num >= 3
+bool is_day4_plus = setup_day_num >= 4
+bool has_setup = is_gsd or is_rsd
+
+// Day 4 breakout rule (M-02)
+bool day4_allowed = true
+if i_enforceDay4Rule and is_day4_plus
+    if is_gsd
+        day4_allowed := close > nz(pdh) // Must break previous day high
+    else if is_rsd
+        day4_allowed := close < nz(pdl) // Must break previous day low
+
+// Session overlap detection (S2.1)
+bool in_sydney = f_in_session(i_sydneyStartHour, i_sydneyStartMin, i_sydneyEndHour, i_sydneyEndMin)
+bool in_asian = f_in_session(i_asianStartHour, i_asianStartMin, i_asianEndHour, i_asianEndMin)
+bool in_london = f_in_session(i_londonStartHour, i_londonStartMin, i_londonEndHour, i_londonEndMin)
+bool in_ny = f_in_session(i_nyStartHour, i_nyStartMin, i_nyEndHour, i_nyEndMin)
+
+bool session_overlap = false
+int overlap_count = 0
+if in_sydney
+    overlap_count += 1
+if in_asian
+    overlap_count += 1
+if in_london
+    overlap_count += 1
+if in_ny
+    overlap_count += 1
+session_overlap := overlap_count >= 2
+
+// Session filter
+bool session_allowed = true
+if i_enableSessionFilter
+    session_allowed := (in_sydney and i_allowSydney) or (in_asian and i_allowAsian) or (in_london and i_allowLondon) or (in_ny and i_allowNY)
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 6A: SESSION BOXES & KILLZONES
+// ═══════════════════════════════════════════════════════════════════════
+
+// Session box arrays
+var box[] sydney_boxes = array.new<box>()
+var box[] asian_boxes = array.new<box>()
+var box[] london_boxes = array.new<box>()
+var box[] ny_boxes = array.new<box>()
+var line[] session_hl_lines = array.new<line>()
+var label[] session_labels = array.new<label>()
+
+// Session state tracking
+var bool sydney_active = false, var float sydney_hi = na, var float sydney_lo = na, var int sydney_start = na
+var bool asian_active = false, var float asian_hi = na, var float asian_lo = na, var int asian_start = na
+var bool london_active = false, var float london_hi = na, var float london_lo = na, var int london_start = na
+var bool ny_active = false, var float ny_hi = na, var float ny_lo = na, var int ny_start = na
+
+f_manage_session_box(_in_session, _active, _hi, _lo, _start, _boxes, _box_color, _border_color, _name, _h_color, _l_color, _show_box) =>
+    bool active = _active
+    float hi = _hi
+    float lo = _lo
+    int start_t = _start
+    
+    if _in_session
+        if not active
+            active := true
+            hi := high
+            lo := low
+            start_t := time
+            if _show_box and i_showSessionBoxes
+                box new_box = box.new(start_t, high, time, low, _border_color, 1, line.style_solid, extend.none, xloc.bar_time, _box_color)
+                array.push(_boxes, new_box)
+                if array.size(_boxes) > i_sessionBoxCount
+                    box.delete(array.shift(_boxes))
+        else
+            hi := math.max(hi, high)
+            lo := math.min(lo, low)
+            if _show_box and i_showSessionBoxes and array.size(_boxes) > 0
+                box last_box = array.get(_boxes, array.size(_boxes) - 1)
+                box.set_top(last_box, hi)
+                box.set_bottom(last_box, lo)
+                box.set_right(last_box, time)
+    else
+        if active
+            active := false
+    [active, hi, lo, start_t]
+
+if i_showSessionBoxes
+    [syd_a, syd_h, syd_l, syd_s] = f_manage_session_box(in_sydney, sydney_active, sydney_hi, sydney_lo, sydney_start, sydney_boxes, i_sydneyBoxColor, i_sydneyBorderColor, "SYD", i_sydneyHColor, i_sydneyLColor, i_showSydneyBox)
+    sydney_active := syd_a, sydney_hi := syd_h, sydney_lo := syd_l, sydney_start := syd_s
+    
+    [asi_a, asi_h, asi_l, asi_s] = f_manage_session_box(in_asian, asian_active, asian_hi, asian_lo, asian_start, asian_boxes, i_asianBoxColor, i_asianBorderColor, "ASIA", i_asianHColor, i_asianLColor, i_showAsianBox)
+    asian_active := asi_a, asian_hi := asi_h, asian_lo := asi_l, asian_start := asi_s
+    
+    [lon_a, lon_h, lon_l, lon_s] = f_manage_session_box(in_london, london_active, london_hi, london_lo, london_start, london_boxes, i_londonBoxColor, i_londonBorderColor, "LON", i_londonHColor, i_londonLColor, i_showLondonBox)
+    london_active := lon_a, london_hi := lon_h, london_lo := lon_l, london_start := lon_s
+    
+    [ny_a, ny_h, ny_l, ny_s] = f_manage_session_box(in_ny, ny_active, ny_hi, ny_lo, ny_start, ny_boxes, i_nyBoxColor, i_nyBorderColor, "NY", i_nyHColor, i_nyLColor, i_showNYBox)
+    ny_active := ny_a, ny_hi := ny_h, ny_lo := ny_l, ny_start := ny_s
+
+// Killzone highlighting
+bool in_kz_asian = f_in_session(i_kzAsianStartHour, i_kzAsianStartMin, i_kzAsianEndHour, i_kzAsianEndMin)
+bool in_kz_london = f_in_session(i_kzLondonStartHour, i_kzLondonStartMin, i_kzLondonEndHour, i_kzLondonEndMin)
+bool in_kz_ny = f_in_session(i_kzNYStartHour, i_kzNYStartMin, i_kzNYEndHour, i_kzNYEndMin)
+bool in_kz_lc = f_in_session(i_kzLCStartHour, i_kzLCStartMin, i_kzLCEndHour, i_kzLCEndMin)
+bool in_any_killzone = in_kz_asian or in_kz_london or in_kz_ny or in_kz_lc
+
+bgcolor(i_showKillzones and i_showKZ_Asian and in_kz_asian ? i_kzAsianColor : na)
+bgcolor(i_showKillzones and i_showKZ_London and in_kz_london ? i_kzLondonColor : na)
+bgcolor(i_showKillzones and i_showKZ_NY and in_kz_ny ? i_kzNYColor : na)
+bgcolor(i_showKillzones and i_showKZ_LondonClose and in_kz_lc ? i_kzLondonCloseColor : na)
+
+// Golden window highlight
+bool in_golden_window = f_in_session(8, 0, 11, 0)
+bgcolor(i_showGoldenWindow and in_golden_window ? color.new(color.yellow, 95) : na)
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 7: ADR LEVELS
+// ═══════════════════════════════════════════════════════════════════════
+
+// ADR calculation
+float adr_val = request.security(syminfo.tickerid, "D", ta.sma(high - low, i_adrPeriod), lookahead=barmerge.lookahead_off)
+
+float adr_anchor = na
+if i_adrAnchor == "Daily Open"
+    adr_anchor := cdo
+else if i_adrAnchor == "Previous Close"
+    adr_anchor := pdc
+else
+    adr_anchor := cdo
+
+float adr_upper = not na(adr_anchor) and not na(adr_val) ? adr_anchor + adr_val / 2.0 : na
+float adr_lower = not na(adr_anchor) and not na(adr_val) ? adr_anchor - adr_val / 2.0 : na
+float adr_mid = not na(adr_upper) and not na(adr_lower) ? (adr_upper + adr_lower) / 2.0 : na
+
+// ADR exhaustion filter (S2.2)
+float adr_used_pct = not na(cd_range) and not na(adr_val) and adr_val > 0 ? (cd_range / adr_val) * 100.0 : 0.0
+bool adr_exhausted = i_enableADRFilter and adr_used_pct >= i_adrFilterThreshold
+
+// ADR hit detection
+bool adr_upper_hit = not na(adr_upper) and high >= adr_upper
+bool adr_lower_hit = not na(adr_lower) and low <= adr_lower
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 7A: EXHAUSTION ZONES
+// ═══════════════════════════════════════════════════════════════════════
+
+// Exhaustion zone arrays
+var float[] ez_top = array.new<float>()
+var float[] ez_bot = array.new<float>()
+var bool[] ez_active = array.new<bool>()
+var bool[] ez_is_bull = array.new<bool>()
+var int[] ez_time = array.new<int>()
+
+// Session exhaustion zone tracking
+var float[] sess_ez_top = array.new<float>()
+var float[] sess_ez_bot = array.new<float>()
+var bool[] sess_ez_active = array.new<bool>()
+
+// First-hour exhaustion tracking (FIX #7)
+var float first_hour_high = na
+var float first_hour_low = na
+var bool first_hour_active = false
+var int first_hour_start = na
+
+if i_showFirstHourExhaustion
+    if is_rollover and not is_sunday
+        first_hour_high := high
+        first_hour_low := low
+        first_hour_active := true
+        first_hour_start := time
+    else if first_hour_active
+        int mins_since_rollover = (hour(time, i_rolloverTimezone) - i_rolloverHour) * 60 + minute(time, i_rolloverTimezone)
+        if mins_since_rollover >= 0 and mins_since_rollover < 60
+            first_hour_high := math.max(nz(first_hour_high, high), high)
+            first_hour_low := math.min(nz(first_hour_low, low), low)
+        else if mins_since_rollover >= 60
+            first_hour_active := false
+
+// Candle absorption (cascade) exhaustion detection
+f_is_absorption(_o, _h, _l, _c, _o1, _h1, _l1, _c1) =>
+    bool bull_absorb = _c > _o and _h > _h1 and _l <= _l1 and (_h - _l) > (_h1 - _l1) * 1.2
+    bool bear_absorb = _c < _o and _l < _l1 and _h >= _h1 and (_h - _l) > (_h1 - _l1) * 1.2
+    [bull_absorb, bear_absorb]
+
+// Check cascade timeframes for absorption
+[h4_bull_abs, h4_bear_abs] = f_is_absorption(h4_o, h4_h, h4_l, h4_c, h4_o1, h4_h1, h4_l1, h4_c1)
+[h1_bull_abs, h1_bear_abs] = f_is_absorption(h1_o, h1_h, h1_l, h1_c, h1_o1, h1_h1, h1_l1, h1_c1)
+[m30_bull_abs, m30_bear_abs] = f_is_absorption(m30_o, m30_h, m30_l, m30_c, m30_o1, m30_h1, m30_l1, m30_c1)
+[m15_bull_abs, m15_bear_abs] = f_is_absorption(m15_o, m15_h, m15_l, m15_c, m15_o1, m15_h1, m15_l1, m15_c1)
+
+// Add new exhaustion zones from cascade
+if i_showCandleExhaustion and i_showExhaustionAreas
+    // H4 zones
+    if h4_bull_abs
+        if array.size(ez_top) < i_maxExhaustionZones
+            array.push(ez_top, h4_h)
+            array.push(ez_bot, math.max(h4_o, h4_c))
+            array.push(ez_active, true)
+            array.push(ez_is_bull, true)
+            array.push(ez_time, time)
+    if h4_bear_abs
+        if array.size(ez_top) < i_maxExhaustionZones
+            array.push(ez_top, math.min(h4_o, h4_c))
+            array.push(ez_bot, h4_l)
+            array.push(ez_active, true)
+            array.push(ez_is_bull, false)
+            array.push(ez_time, time)
+    // H1 zones
+    if h1_bull_abs
+        if array.size(ez_top) < i_maxExhaustionZones
+            array.push(ez_top, h1_h)
+            array.push(ez_bot, math.max(h1_o, h1_c))
+            array.push(ez_active, true)
+            array.push(ez_is_bull, true)
+            array.push(ez_time, time)
+    if h1_bear_abs
+        if array.size(ez_top) < i_maxExhaustionZones
+            array.push(ez_top, math.min(h1_o, h1_c))
+            array.push(ez_bot, h1_l)
+            array.push(ez_active, true)
+            array.push(ez_is_bull, false)
+            array.push(ez_time, time)
+    // 30m zones
+    if m30_bull_abs
+        if array.size(ez_top) < i_maxExhaustionZones
+            array.push(ez_top, m30_h)
+            array.push(ez_bot, math.max(m30_o, m30_c))
+            array.push(ez_active, true)
+            array.push(ez_is_bull, true)
+            array.push(ez_time, time)
+    if m30_bear_abs
+        if array.size(ez_top) < i_maxExhaustionZones
+            array.push(ez_top, math.min(m30_o, m30_c))
+            array.push(ez_bot, m30_l)
+            array.push(ez_active, true)
+            array.push(ez_is_bull, false)
+            array.push(ez_time, time)
+    // 15m zones
+    if m15_bull_abs
+        if array.size(ez_top) < i_maxExhaustionZones
+            array.push(ez_top, m15_h)
+            array.push(ez_bot, math.max(m15_o, m15_c))
+            array.push(ez_active, true)
+            array.push(ez_is_bull, true)
+            array.push(ez_time, time)
+    if m15_bear_abs
+        if array.size(ez_top) < i_maxExhaustionZones
+            array.push(ez_top, math.min(m15_o, m15_c))
+            array.push(ez_bot, m15_l)
+            array.push(ez_active, true)
+            array.push(ez_is_bull, false)
+            array.push(ez_time, time)
+
+// Invalidate exhaustion zones on penetration
+if array.size(ez_top) > 0
+    for i = array.size(ez_top) - 1 to 0
+        if i < array.size(ez_active) and array.get(ez_active, i)
+            float zt = array.get(ez_top, i)
+            float zb = array.get(ez_bot, i)
+            if close > zt or close < zb
+                array.set(ez_active, i, false)
+
+// Terminate at rollover (if enabled)
+if i_terminateAtRollover and is_rollover and not is_sunday
+    for i = 0 to array.size(ez_active) - 1
+        array.set(ez_active, i, false)
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 8: EMA ALIGNMENT & CONFLUENCE SCORING
+// ═══════════════════════════════════════════════════════════════════════
+
+// EMA stack alignment per timeframe
+f_ema_stack_bull(_e9, _e18, _e50, _s50) =>
+    _e9 > _e18 and _e18 > _e50 and _e50 > _s50
+
+f_ema_stack_bear(_e9, _e18, _e50, _s50) =>
+    _e9 < _e18 and _e18 < _e50 and _e50 < _s50
+
+// HTF alignment
+bool h4_ema_bull = f_ema_stack_bull(htf_4hr_ema9, htf_4hr_ema18, htf_4hr_ema50, htf_4hr_sma50)
+bool h4_ema_bear = f_ema_stack_bear(htf_4hr_ema9, htf_4hr_ema18, htf_4hr_ema50, htf_4hr_sma50)
+bool h2_ema_bull = f_ema_stack_bull(htf_2hr_ema9, htf_2hr_ema18, htf_2hr_ema50, htf_2hr_sma50)
+bool h2_ema_bear = f_ema_stack_bear(htf_2hr_ema9, htf_2hr_ema18, htf_2hr_ema50, htf_2hr_sma50)
+bool h1_ema_bull = f_ema_stack_bull(htf_1hr_ema9, htf_1hr_ema18, htf_1hr_ema50, htf_1hr_sma50)
+bool h1_ema_bear = f_ema_stack_bear(htf_1hr_ema9, htf_1hr_ema18, htf_1hr_ema50, htf_1hr_sma50)
+
+// LTF alignment
+bool m30_ema_bull = f_ema_stack_bull(ltf_30m_ema9, ltf_30m_ema18, ltf_30m_ema50, ltf_30m_sma50)
+bool m30_ema_bear = f_ema_stack_bear(ltf_30m_ema9, ltf_30m_ema18, ltf_30m_ema50, ltf_30m_sma50)
+bool m15_ema_bull = f_ema_stack_bull(ltf_15m_ema9, ltf_15m_ema18, ltf_15m_ema50, ltf_15m_sma50)
+bool m15_ema_bear = f_ema_stack_bear(ltf_15m_ema9, ltf_15m_ema18, ltf_15m_ema50, ltf_15m_sma50)
+
+// Baseline touch detection
+f_touched_level(_price, _lookback) =>
+    bool touched = false
+    for i = 0 to _lookback - 1
+        if low[i] <= _price and high[i] >= _price
+            touched := true
+            break
+    touched
+
+// HTF baseline touches
+bool h1_baseline_touched = f_touched_level(htf_1hr_ema50, i_htfBaselineLookback1hr)
+bool h2_baseline_touched = f_touched_level(htf_2hr_ema50, i_htfBaselineLookback2hr)
+
+// HTF EQ proximity
+bool h1_near_eq = false
+if not na(htf_1hr_ema50) and not na(htf_1hr_sma50)
+    float h1_eq = (htf_1hr_ema50 + htf_1hr_sma50) / 2.0
+    h1_near_eq := math.abs(close - h1_eq) < 20 * pip_val
+
+bool h2_near_eq = false
+if not na(htf_2hr_ema50) and not na(htf_2hr_sma50)
+    float h2_eq = (htf_2hr_ema50 + htf_2hr_sma50) / 2.0
+    h2_near_eq := math.abs(close - h2_eq) < 20 * pip_val
+
+// HTF rejection detection
+f_htf_rejection_bull(_ema50, _lookback) =>
+    bool rejected = false
+    for i = 0 to _lookback - 1
+        if low[i] <= _ema50 and close[i] > _ema50
+            rejected := true
+            break
+    rejected
+
+f_htf_rejection_bear(_ema50, _lookback) =>
+    bool rejected = false
+    for i = 0 to _lookback - 1
+        if high[i] >= _ema50 and close[i] < _ema50
+            rejected := true
+            break
+    rejected
+
+bool h1_rejection_bull = f_htf_rejection_bull(htf_1hr_ema50, i_htfRejectionLookback1hr)
+bool h1_rejection_bear = f_htf_rejection_bear(htf_1hr_ema50, i_htfRejectionLookback1hr)
+bool h2_rejection_bull = f_htf_rejection_bull(htf_2hr_ema50, i_htfRejectionLookback2hr)
+bool h2_rejection_bear = f_htf_rejection_bear(htf_2hr_ema50, i_htfRejectionLookback2hr)
+
+// HTF confirmation
+bool htf_bull_confirmed = true
+bool htf_bear_confirmed = true
+if i_requireHTFConfirmation
+    htf_bull_confirmed := (h1_ema_bull or h2_ema_bull) and (h1_baseline_touched or h2_baseline_touched)
+    htf_bear_confirmed := (h1_ema_bear or h2_ema_bear) and (h1_baseline_touched or h2_baseline_touched)
+if i_blockOnHTFRejection
+    if h1_rejection_bear or h2_rejection_bear
+        htf_bull_confirmed := false
+    if h1_rejection_bull or h2_rejection_bull
+        htf_bear_confirmed := false
+
+// LTF baseline touches
+bool m15_50ema_touched = f_touched_level(ltf_15m_ema50, i_ltf50EMALookback15m)
+bool m30_50ema_touched = f_touched_level(ltf_30m_ema50, i_ltf50EMALookback30m)
+bool m15_50sma_touched = f_touched_level(ltf_15m_sma50, i_ltf50SMALookback15m)
+bool m30_50sma_touched = f_touched_level(ltf_30m_sma50, i_ltf50SMALookback30m)
+bool m15_18ema_touched = f_touched_level(ltf_15m_ema18, i_ltf18EMALookback15m)
+bool m30_18ema_touched = f_touched_level(ltf_30m_ema18, i_ltf18EMALookback30m)
+bool m15_9ema_touched = f_touched_level(ltf_15m_ema9, i_ltf9EMALookback15m)
+bool m30_9ema_touched = f_touched_level(ltf_30m_ema9, i_ltf9EMALookback30m)
+
+// EQ rejection check
+f_eq_rejection_bull(_lookback) =>
+    bool rej = false
+    if not na(pdeq)
+        for i = 0 to _lookback - 1
+            if low[i] <= pdeq and close[i] > pdeq
+                rej := true
+                break
+    rej
+
+f_eq_rejection_bear(_lookback) =>
+    bool rej = false
+    if not na(pdeq)
+        for i = 0 to _lookback - 1
+            if high[i] >= pdeq and close[i] < pdeq
+                rej := true
+                break
+    rej
+
+// EQ signal counting
+var int eq_signal_count = 0
+if is_rollover and not is_sunday
+    eq_signal_count := 0
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 8A: CONFLUENCE SCORING
+// ═══════════════════════════════════════════════════════════════════════
+
+// Day 3 confluence (max 12 points)
+f_day3_confluence_15m(_is_long) =>
+    int score = 0
+    // HTF alignment (0-3)
+    if _is_long
+        if h4_ema_bull
+            score += 1
+        if h1_ema_bull
+            score += 1
+        if h2_ema_bull
+            score += 1
+    else
+        if h4_ema_bear
+            score += 1
+        if h1_ema_bear
+            score += 1
+        if h2_ema_bear
+            score += 1
+    // LTF alignment (0-2)
+    if _is_long ? m15_ema_bull : m15_ema_bear
+        score += 1
+    if _is_long ? m30_ema_bull : m30_ema_bear
+        score += 1
+    // Baseline touches (0-3)
+    if m15_50ema_touched
+        score += 1
+    if m15_50sma_touched
+        score += 1
+    if m15_18ema_touched
+        score += 1
+    // EQ rejection (0-1)
+    if i_requireEQRejection
+        bool eq_rej = _is_long ? f_eq_rejection_bull(i_eqLookback15m) : f_eq_rejection_bear(i_eqLookback15m)
+        if eq_rej
+            score += 1
+    // Day classification bonus (0-2)
+    if is_day3
+        score += 1
+    if day_label_type == DLABEL_CLEAN_BULL and _is_long
+        score += 1
+    else if day_label_type == DLABEL_CLEAN_BEAR and not _is_long
+        score += 1
+    // Session overlap bonus (S2.1)
+    if i_enableOverlapConfluence and session_overlap
+        score += 1
+    // v10 boost
+    score += i_confluenceBoost
+    score
+
+f_day3_confluence_30m(_is_long) =>
+    int score = 0
+    if _is_long
+        if h4_ema_bull
+            score += 1
+        if h1_ema_bull
+            score += 1
+        if h2_ema_bull
+            score += 1
+    else
+        if h4_ema_bear
+            score += 1
+        if h1_ema_bear
+            score += 1
+        if h2_ema_bear
+            score += 1
+    if _is_long ? m30_ema_bull : m30_ema_bear
+        score += 1
+    if _is_long ? m15_ema_bull : m15_ema_bear
+        score += 1
+    if m30_50ema_touched
+        score += 1
+    if m30_50sma_touched
+        score += 1
+    if m30_18ema_touched
+        score += 1
+    if i_requireEQRejection
+        bool eq_rej = _is_long ? f_eq_rejection_bull(i_eqLookback30m) : f_eq_rejection_bear(i_eqLookback30m)
+        if eq_rej
+            score += 1
+    if is_day3
+        score += 1
+    if day_label_type == DLABEL_CLEAN_BULL and _is_long
+        score += 1
+    else if day_label_type == DLABEL_CLEAN_BEAR and not _is_long
+        score += 1
+    if i_enableOverlapConfluence and session_overlap
+        score += 1
+    score += i_confluenceBoost
+    score
+
+// Pure Madstrat confluence (max 11 points)
+f_pure_confluence_15m(_is_long) =>
+    int score = 0
+    if _is_long
+        if h4_ema_bull
+            score += 1
+        if h1_ema_bull
+            score += 1
+        if h2_ema_bull
+            score += 1
+    else
+        if h4_ema_bear
+            score += 1
+        if h1_ema_bear
+            score += 1
+        if h2_ema_bear
+            score += 1
+    if _is_long ? m15_ema_bull : m15_ema_bear
+        score += 2
+    if m15_50ema_touched
+        score += 1
+    if m15_50sma_touched
+        score += 1
+    if m15_18ema_touched
+        score += 1
+    if m15_9ema_touched
+        score += 1
+    if i_enableOverlapConfluence and session_overlap
+        score += 1
+    score += i_confluenceBoost
+    score
+
+f_pure_confluence_30m(_is_long) =>
+    int score = 0
+    if _is_long
+        if h4_ema_bull
+            score += 1
+        if h1_ema_bull
+            score += 1
+        if h2_ema_bull
+            score += 1
+    else
+        if h4_ema_bear
+            score += 1
+        if h1_ema_bear
+            score += 1
+        if h2_ema_bear
+            score += 1
+    if _is_long ? m30_ema_bull : m30_ema_bear
+        score += 2
+    if m30_50ema_touched
+        score += 1
+    if m30_50sma_touched
+        score += 1
+    if m30_18ema_touched
+        score += 1
+    if m30_9ema_touched
+        score += 1
+    if i_enableOverlapConfluence and session_overlap
+        score += 1
+    score += i_confluenceBoost
+    score
+
+// Dynamic confluence threshold (Day 3)
+f_dynamic_threshold(_day_num) =>
+    int thresh = 3
+    if _day_num == 2
+        thresh := 5
+    else if _day_num == 3
+        thresh := 4
+    else if _day_num >= 4
+        thresh := 3
+    thresh
+
+int dyn_threshold = i_useDynamicConfluence ? f_dynamic_threshold(setup_day_num) : i_day3MinConfluence
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 9: SIGNAL GENERATION & ENTRY CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Candle pattern detection
+bool bullish_engulf = close > open and close[1] < open[1] and close > open[1] and open < close[1]
+bool bearish_engulf = close < open and close[1] > open[1] and close < open[1] and open > close[1]
+bool bull_pin = (high - low) > 0 and (close - low) / (high - low) > 0.6 and (open - low) / (high - low) > 0.6
+bool bear_pin = (high - low) > 0 and (high - close) / (high - low) > 0.6 and (high - open) / (high - low) > 0.6
+
+// Direction lock filter (v10)
+bool long_allowed = i_directionLock != "Short Only"
+bool short_allowed = i_directionLock != "Long Only"
+
+// FBR direction enforcement (M-03)
+bool fbr_long_ok = true
+bool fbr_short_ok = true
+if i_enforceFBRDirection
+    if day_label_type == DLABEL_FBR_BULL
+        fbr_short_ok := false
+    if day_label_type == DLABEL_FBR_BEAR
+        fbr_long_ok := false
+
+// Daily candle direction enforcement (W-13)
+bool daily_dir_long_ok = true
+bool daily_dir_short_ok = true
+if i_enforceDailyDirection
+    if not na(pdo) and not na(pdc)
+        if pdc < pdo  // Previous day was red
+            daily_dir_long_ok := false
+        if pdc > pdo  // Previous day was green
+            daily_dir_short_ok := false
+
+// Signal generation counters
+var int signals_this_session = 0
+if is_rollover and not is_sunday
+    signals_this_session := 0
+
+// Risk management state
+var int daily_losses = 0
+var int daily_trades = 0
+var int weekly_trades = 0
+var int consec_losses = 0
+var float daily_pnl_pct = 0.0
+var float weekly_pnl_pct = 0.0
+
+if is_rollover and not is_sunday
+    daily_losses := 0
+    daily_trades := 0
+    daily_pnl_pct := 0.0
+if is_monday and is_rollover
+    weekly_trades := 0
+    weekly_pnl_pct := 0.0
+
+// Risk guards
+bool dd_breaker_ok = not i_enableDDBreaker or daily_pnl_pct > -i_maxDailyDD
+bool three_strike_ok = not i_enableThreeStrike or daily_losses < i_maxDailyLosses
+bool freq_limit_ok = not i_enableTradeFreqLimit or (daily_trades < i_maxDailyTrades and weekly_trades < i_maxWeeklyTrades)
+bool weekly_dd_ok = not i_enableWeeklyDD or weekly_pnl_pct > -i_maxWeeklyDD
+bool consec_loss_ok = not i_enableConsecLossLimit or consec_losses < i_maxConsecLosses
+
+// Core trade permission
+bool can_trade = strategy.position_size == 0  // FIX #8: Removed dead i_maxConcurrentTrades
+bool risk_ok = dd_breaker_ok and three_strike_ok and freq_limit_ok and weekly_dd_ok and consec_loss_ok
+bool kz_ok = f_in_killzone()
+bool not_adr_exhausted = not adr_exhausted
+
+// Combined entry gate
+bool entry_gate = can_trade and risk_ok and session_allowed and kz_ok and not_adr_exhausted and not inside_day_freeze
+
+// ── Day 2/3 Signals ──
+// 15m Long
+bool d3_long_15m = false
+if i_showDay3 and i_trade15m and entry_gate and long_allowed and has_setup and (is_day2 or is_day3 or (is_day4_plus and day4_allowed))
+    if is_gsd and htf_bull_confirmed and htf_trend_bull and fbr_long_ok and daily_dir_long_ok
+        int conf = f_day3_confluence_15m(true)
+        if conf >= dyn_threshold
+            if bullish_engulf or bull_pin
+                d3_long_15m := true
+
+// 15m Short
+bool d3_short_15m = false
+if i_showDay3 and i_trade15m and entry_gate and short_allowed and has_setup and (is_day2 or is_day3 or (is_day4_plus and day4_allowed))
+    if is_rsd and htf_bear_confirmed and htf_trend_bear and fbr_short_ok and daily_dir_short_ok
+        int conf = f_day3_confluence_15m(false)
+        if conf >= dyn_threshold
+            if bearish_engulf or bear_pin
+                d3_short_15m := true
+
+// 30m Long
+bool d3_long_30m = false
+if i_showDay3 and i_trade30m and entry_gate and long_allowed and has_setup and (is_day2 or is_day3 or (is_day4_plus and day4_allowed))
+    if is_gsd and htf_bull_confirmed and htf_trend_bull and fbr_long_ok and daily_dir_long_ok
+        int conf = f_day3_confluence_30m(true)
+        if conf >= dyn_threshold
+            if bullish_engulf or bull_pin
+                d3_long_30m := true
+
+// 30m Short
+bool d3_short_30m = false
+if i_showDay3 and i_trade30m and entry_gate and short_allowed and has_setup and (is_day2 or is_day3 or (is_day4_plus and day4_allowed))
+    if is_rsd and htf_bear_confirmed and htf_trend_bear and fbr_short_ok and daily_dir_short_ok
+        int conf = f_day3_confluence_30m(false)
+        if conf >= dyn_threshold
+            if bearish_engulf or bear_pin
+                d3_short_30m := true
+
+// ── Pure Madstrat Signals ──
+// 15m Long
+bool pure_long_15m = false
+if i_showPureMad and i_trade15m and entry_gate and long_allowed and htf_bull_confirmed and htf_trend_bull and fbr_long_ok
+    int conf = f_pure_confluence_15m(true)
+    if conf >= i_pureMinConfluence
+        if bullish_engulf or bull_pin
+            pure_long_15m := true
+
+// 15m Short
+bool pure_short_15m = false
+if i_showPureMad and i_trade15m and entry_gate and short_allowed and htf_bear_confirmed and htf_trend_bear and fbr_short_ok
+    int conf = f_pure_confluence_15m(false)
+    if conf >= i_pureMinConfluence
+        if bearish_engulf or bear_pin
+            pure_short_15m := true
+
+// 30m Long
+bool pure_long_30m = false
+if i_showPureMad and i_trade30m and entry_gate and long_allowed and htf_bull_confirmed and htf_trend_bull and fbr_long_ok
+    int conf = f_pure_confluence_30m(true)
+    if conf >= i_pureMinConfluence
+        if bullish_engulf or bull_pin
+            pure_long_30m := true
+
+// 30m Short
+bool pure_short_30m = false
+if i_showPureMad and i_trade30m and entry_gate and short_allowed and htf_bear_confirmed and htf_trend_bear and fbr_short_ok
+    int conf = f_pure_confluence_30m(false)
+    if conf >= i_pureMinConfluence
+        if bearish_engulf or bear_pin
+            pure_short_30m := true
+
+// Aggregate signals
+bool any_long = d3_long_15m or d3_long_30m or pure_long_15m or pure_long_30m
+bool any_short = d3_short_15m or d3_short_30m or pure_short_15m or pure_short_30m
+bool any_signal = any_long or any_short
+
+// Signal count enforcement
+if any_signal
+    signals_this_session += 1
+    if signals_this_session > i_maxSignalsPerSession
+        d3_long_15m := false, d3_short_15m := false
+        d3_long_30m := false, d3_short_30m := false
+        pure_long_15m := false, pure_short_15m := false
+        pure_long_30m := false, pure_short_30m := false
+        any_long := false, any_short := false, any_signal := false
+
+// EQ signal count enforcement
+if any_signal and i_requireEQRejection
+    eq_signal_count += 1
+    if eq_signal_count > i_maxEQSignals
+        d3_long_15m := false, d3_short_15m := false
+        d3_long_30m := false, d3_short_30m := false
+        pure_long_15m := false, pure_short_15m := false
+        pure_long_30m := false, pure_short_30m := false
+        any_long := false, any_short := false, any_signal := false
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 10: STRATEGY EXECUTION (FIX #2/#3/#4/#9)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Setup grade determination
+f_setup_grade(_is_day3, _conf, _has_clean_break) =>
+    string grade = "B"
+    if _is_day3 and _conf >= 8 and _has_clean_break
+        grade := "A"
+    else if _is_day3 and _conf >= 6
+        grade := "A"
+    grade
+
+// SL/TP calculation
+f_calc_sl_tp(_entry, _is_long, _sl_price, _risk_pct) =>
+    float sl_dist = math.abs(_entry - _sl_price)
+    float max_sl = i_maxSlPips * pip_val
+    float actual_sl_dist = math.min(sl_dist, max_sl)
+    float sl = _is_long ? _entry - actual_sl_dist : _entry + actual_sl_dist
+    float tp1 = _is_long ? _entry + actual_sl_dist * 2.0 : _entry - actual_sl_dist * 2.0
+    float tp2 = _is_long ? _entry + actual_sl_dist * 3.0 : _entry - actual_sl_dist * 3.0
+    float tp3 = _is_long ? _entry + actual_sl_dist * 4.0 : _entry - actual_sl_dist * 4.0
+    [sl, tp1, tp2, tp3, actual_sl_dist]
+
+// Position sizing
+f_calc_qty(_risk_pct, _sl_dist) =>
+    float risk_amount = strategy.equity * (_risk_pct / 100.0)
+    float tick_value = syminfo.pointvalue * syminfo.mintick
+    float qty = tick_value > 0 and _sl_dist > 0 ? risk_amount / (_sl_dist / syminfo.mintick * tick_value) : 0.0
+    math.max(qty, syminfo.mintick)
+
+// Entry execution function (FIX #4: removed stop= for non-backtest)
+f_execute_entry(_signal, _is_long, _name, _entry_price, _sl_price, _risk_pct) =>
+    if _signal
+        [sl, tp1, tp2, tp3, sl_dist] = f_calc_sl_tp(_entry_price, _is_long, _sl_price, _risk_pct)
+        float qty = i_useDefaultQty ? strategy.initial_capital * 0.02 / (sl_dist / syminfo.mintick * syminfo.pointvalue * syminfo.mintick) : f_calc_qty(_risk_pct, sl_dist)
+        qty := math.max(qty, syminfo.mintick)
+        float rr = sl_dist > 0 ? math.abs(tp1 - _entry_price) / sl_dist : 0.0
+        if rr >= i_minRR
+            // FIX #4: Always use market entries (no stop= parameter)
+            if _is_long
+                strategy.entry(_name, strategy.long, qty=qty)
+            else
+                strategy.entry(_name, strategy.short, qty=qty)
+            // Set initial exits
+            float tp1_close_qty = qty * (i_tp1ClosePct / 100.0)
+            strategy.exit("TP1 " + _name, _name, qty=tp1_close_qty, limit=tp1, stop=sl)
+            strategy.exit("SL " + _name, _name, stop=sl)
+
+// Entry SL determination (nearest level below/above)
+float long_sl = na
+float short_sl = na
+if not na(pdl)
+    long_sl := pdl - spread_value
+if not na(pdh)
+    short_sl := pdh + spread_value
+
+// Exhaustion zone SL refinement
+if array.size(ez_top) > 0 and array.size(ez_bot) > 0 and array.size(ez_active) > 0
+    float ez_sl_long = f_find_exhaustion_zone(close, true, ez_top, ez_bot, ez_active, array.size(ez_top), 0)
+    float ez_sl_short = f_find_exhaustion_zone(close, false, ez_top, ez_bot, ez_active, array.size(ez_top), 0)
+    if not na(ez_sl_long) and (na(long_sl) or ez_sl_long > long_sl)
+        long_sl := ez_sl_long - spread_value
+    if not na(ez_sl_short) and (na(short_sl) or ez_sl_short < short_sl)
+        short_sl := ez_sl_short + spread_value
+
+// Risk percentage selection
+float risk_pct_long = 0.0
+float risk_pct_short = 0.0
+
+// Day 3 signals
+if d3_long_15m or d3_long_30m
+    bool is_clean = day_label_type == DLABEL_CLEAN_BULL
+    int conf = d3_long_15m ? f_day3_confluence_15m(true) : f_day3_confluence_30m(true)
+    string grade = f_setup_grade(is_day3, conf, is_clean)
+    risk_pct_long := grade == "A" ? i_riskPercent_A : i_riskPercent_B
+    if i_setupType == "A Setups Only" and grade != "A"
+        d3_long_15m := false, d3_long_30m := false
+    if i_setupType == "B Setups Only" and grade != "B"
+        d3_long_15m := false, d3_long_30m := false
+
+if d3_short_15m or d3_short_30m
+    bool is_clean = day_label_type == DLABEL_CLEAN_BEAR
+    int conf = d3_short_15m ? f_day3_confluence_15m(false) : f_day3_confluence_30m(false)
+    string grade = f_setup_grade(is_day3, conf, is_clean)
+    risk_pct_short := grade == "A" ? i_riskPercent_A : i_riskPercent_B
+    if i_setupType == "A Setups Only" and grade != "A"
+        d3_short_15m := false, d3_short_30m := false
+    if i_setupType == "B Setups Only" and grade != "B"
+        d3_short_15m := false, d3_short_30m := false
+
+// Pure signals use B risk
+if pure_long_15m or pure_long_30m
+    risk_pct_long := i_riskPercent_B
+if pure_short_15m or pure_short_30m
+    risk_pct_short := i_riskPercent_B
+
+// Execute entries
+if not na(long_sl)
+    f_execute_entry(d3_long_15m, true, "D3L15", close, long_sl, risk_pct_long)
+    f_execute_entry(d3_long_30m, true, "D3L30", close, long_sl, risk_pct_long)
+    f_execute_entry(pure_long_15m, true, "PML15", close, long_sl, risk_pct_long)
+    f_execute_entry(pure_long_30m, true, "PML30", close, long_sl, risk_pct_long)
+if not na(short_sl)
+    f_execute_entry(d3_short_15m, false, "D3S15", close, short_sl, risk_pct_short)
+    f_execute_entry(d3_short_30m, false, "D3S30", close, short_sl, risk_pct_short)
+    f_execute_entry(pure_short_15m, false, "PMS15", close, short_sl, risk_pct_short)
+    f_execute_entry(pure_short_30m, false, "PMS30", close, short_sl, risk_pct_short)
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 10A: EXIT MANAGEMENT, BREAKEVEN & TRAILING (FIX #2/#3/#9)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Position tracking
+var float entry_price_long = na
+var float entry_price_short = na
+var float sl_price_long = na
+var float sl_price_short = na
+var bool tp1_hit_long = false
+var bool tp1_hit_short = false
+var bool be_activated_long = false
+var bool be_activated_short = false
+var float last_be_price_long = na   // FIX #9: Guard BE overwrites
+var float last_be_price_short = na
+var bool first_level_be_long = false  // FIX #3: BE on first daily level
+var bool first_level_be_short = false
+
+// Track entry on new position
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    entry_price_long := strategy.position_avg_price
+    sl_price_long := long_sl
+    tp1_hit_long := false
+    be_activated_long := false
+    last_be_price_long := na
+    first_level_be_long := false
+    daily_trades += 1
+    weekly_trades += 1
+
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    entry_price_short := strategy.position_avg_price
+    sl_price_short := short_sl
+    tp1_hit_short := false
+    be_activated_short := false
+    last_be_price_short := na
+    first_level_be_short := false
+    daily_trades += 1
+    weekly_trades += 1
+
+// Detect TP1 hit (partial close reduces position)
+if strategy.position_size > 0 and strategy.position_size < strategy.position_size[1] and not tp1_hit_long
+    tp1_hit_long := true
+if strategy.position_size < 0 and math.abs(strategy.position_size) < math.abs(strategy.position_size[1]) and not tp1_hit_short
+    tp1_hit_short := true
+
+// FIX #3: Breakeven on first daily level
+if i_breakevenOnFirstLevel and strategy.position_size > 0 and not be_activated_long and not tp1_hit_long
+    if not na(pdh) and high >= pdh and not na(entry_price_long)
+        first_level_be_long := true
+    if not na(pdeq) and high >= pdeq and close > entry_price_long
+        first_level_be_long := true
+
+if i_breakevenOnFirstLevel and strategy.position_size < 0 and not be_activated_short and not tp1_hit_short
+    if not na(pdl) and low <= pdl and not na(entry_price_short)
+        first_level_be_short := true
+    if not na(pdeq) and low <= pdeq and close < entry_price_short
+        first_level_be_short := true
+
+// Breakeven management (FIX #9: Only reissue when price changes)
+if i_enableBreakeven and strategy.position_size > 0 and (tp1_hit_long or first_level_be_long) and not be_activated_long
+    if not na(entry_price_long)
+        float be_price = entry_price_long + i_breakevenOffsetPips * pip_val
+        if na(last_be_price_long) or math.abs(be_price - last_be_price_long) > syminfo.mintick
+            string eid = strategy.opentrades > 0 ? strategy.opentrades.entry_id(0) : ""
+            if eid != ""
+                strategy.exit("BE " + eid, eid, stop=be_price)
+                last_be_price_long := be_price
+                be_activated_long := true
+
+if i_enableBreakeven and strategy.position_size < 0 and (tp1_hit_short or first_level_be_short) and not be_activated_short
+    if not na(entry_price_short)
+        float be_price = entry_price_short - i_breakevenOffsetPips * pip_val
+        if na(last_be_price_short) or math.abs(be_price - last_be_price_short) > syminfo.mintick
+            string eid = strategy.opentrades > 0 ? strategy.opentrades.entry_id(0) : ""
+            if eid != ""
+                strategy.exit("BE " + eid, eid, stop=be_price)
+                last_be_price_short := be_price
+                be_activated_short := true
+
+// FIX #2: Trailing stop implementation after TP1
+if strategy.position_size > 0 and tp1_hit_long and i_trailMode != "None"
+    float trail_sl = na
+    string eid = strategy.opentrades > 0 ? strategy.opentrades.entry_id(0) : ""
+    if i_trailMode == "EMA 9"
+        trail_sl := eff_15m_ema9
+    else if i_trailMode == "EMA 18"
+        trail_sl := eff_15m_ema18
+    else if i_trailMode == "Fixed Pips"
+        float highest_since = ta.highest(high, 10)
+        trail_sl := highest_since - i_trailFixedPips * pip_val
+    else if i_trailMode == "ATR"
+        trail_sl := close - i_trailAtrMult * trail_atr
+    // Only ratchet upward (never widen stop)
+    if not na(trail_sl) and not na(sl_price_long)
+        trail_sl := math.max(trail_sl, nz(sl_price_long))
+        if trail_sl > sl_price_long
+            sl_price_long := trail_sl
+            if eid != ""
+                strategy.exit("Trail " + eid, eid, stop=trail_sl)
+
+if strategy.position_size < 0 and tp1_hit_short and i_trailMode != "None"
+    float trail_sl = na
+    string eid = strategy.opentrades > 0 ? strategy.opentrades.entry_id(0) : ""
+    if i_trailMode == "EMA 9"
+        trail_sl := eff_15m_ema9
+    else if i_trailMode == "EMA 18"
+        trail_sl := eff_15m_ema18
+    else if i_trailMode == "Fixed Pips"
+        float lowest_since = ta.lowest(low, 10)
+        trail_sl := lowest_since + i_trailFixedPips * pip_val
+    else if i_trailMode == "ATR"
+        trail_sl := close + i_trailAtrMult * trail_atr
+    // Only ratchet downward (never widen stop)
+    if not na(trail_sl) and not na(sl_price_short)
+        trail_sl := math.min(trail_sl, nz(sl_price_short))
+        if trail_sl < sl_price_short
+            sl_price_short := trail_sl
+            if eid != ""
+                strategy.exit("Trail " + eid, eid, stop=trail_sl)
+
+// Track trade results for risk management
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    float trade_pnl = strategy.netprofit - strategy.netprofit[1]
+    float trade_pnl_pct = strategy.equity > 0 ? (trade_pnl / strategy.equity) * 100.0 : 0.0
+    daily_pnl_pct += trade_pnl_pct
+    weekly_pnl_pct += trade_pnl_pct
+    if trade_pnl < 0
+        daily_losses += 1
+        consec_losses += 1
+    else
+        consec_losses := 0
+
+// M1-R3 EMA reversal exit
+if i_enableM1R3Exit and strategy.position_size > 0
+    if close < eff_15m_ema18 and close[1] > eff_15m_ema18[1]
+        strategy.close_all("M1R3 Rev")
+
+if i_enableM1R3Exit and strategy.position_size < 0
+    if close > eff_15m_ema18 and close[1] < eff_15m_ema18[1]
+        strategy.close_all("M1R3 Rev")
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 11: VISUAL OVERLAYS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Chart EMAs
+plot(i_showChartMAs ? ema9 : na, "EMA 9", i_ema9Color, i_ema9Width)
+plot(i_showChartMAs ? ema18 : na, "EMA 18", i_ema18Color, i_ema18Width)
+plot(i_showChartMAs ? ema50 : na, "EMA 50", i_ema50Color, i_ema50Width)
+plot(i_showChartMAs ? sma50 : na, "SMA 50", i_sma50Color, i_sma50Width)
+
+// Signal markers
+plotshape(d3_long_15m, "D3 Buy 15m", shape.triangleup, location.belowbar, i_d3Buy15mColor, size=size.small)
+plotshape(d3_short_15m, "D3 Sell 15m", shape.triangledown, location.abovebar, i_d3Sell15mColor, size=size.small)
+plotshape(d3_long_30m, "D3 Buy 30m", shape.triangleup, location.belowbar, i_d3Buy30mColor, size=size.small)
+plotshape(d3_short_30m, "D3 Sell 30m", shape.triangledown, location.abovebar, i_d3Sell30mColor, size=size.small)
+plotshape(pure_long_15m, "Pure Buy 15m", shape.diamond, location.belowbar, i_madBuy15mColor, size=size.small)
+plotshape(pure_short_15m, "Pure Sell 15m", shape.diamond, location.abovebar, i_madSell15mColor, size=size.small)
+plotshape(pure_long_30m, "Pure Buy 30m", shape.diamond, location.belowbar, i_madBuy30mColor, size=size.small)
+plotshape(pure_short_30m, "Pure Sell 30m", shape.diamond, location.abovebar, i_madSell30mColor, size=size.small)
+
+// ADR levels
+var line adr_upper_line = na, var line adr_lower_line = na, var line adr_mid_line = na
+var label adr_upper_label = na, var label adr_lower_label = na, var label adr_mid_label = na
+
+if barstate.islast and i_showADR
+    line.delete(adr_upper_line), line.delete(adr_lower_line), line.delete(adr_mid_line)
+    label.delete(adr_upper_label), label.delete(adr_lower_label), label.delete(adr_mid_label)
+    
+    string ls = f_line_style(i_adrLineStyle)
+    int ext_right = i_extendADRLines ? bar_index + 20 : bar_index
+    
+    if not na(adr_upper)
+        adr_upper_line := line.new(bar_index - 50, adr_upper, ext_right, adr_upper, color=i_adrUpperColor, width=i_adrLineWidth, style=ls)
+    if not na(adr_lower)
+        adr_lower_line := line.new(bar_index - 50, adr_lower, ext_right, adr_lower, color=i_adrLowerColor, width=i_adrLineWidth, style=ls)
+    if i_showADRMidline and not na(adr_mid)
+        adr_mid_line := line.new(bar_index - 50, adr_mid, ext_right, adr_mid, color=i_adrMidColor, width=1, style=line.style_dotted)
+    
+    if i_showADRLabels
+        if not na(adr_upper)
+            adr_upper_label := label.new(ext_right, adr_upper, "ADR+", style=label.style_label_left, color=color.new(color.red, 80), textcolor=color.red, size=size.tiny)
+        if not na(adr_lower)
+            adr_lower_label := label.new(ext_right, adr_lower, "ADR-", style=label.style_label_left, color=color.new(color.green, 80), textcolor=color.green, size=size.tiny)
+
+// ADR fill
+var linefill adr_fill = na
+if i_showADRFill and not na(adr_upper_line) and not na(adr_lower_line)
+    linefill.delete(adr_fill)
+    adr_fill := linefill.new(adr_upper_line, adr_lower_line, i_adrFillColor)
+
+// ADR hit markers
+plotshape(i_showADRHitMarker and adr_upper_hit, "ADR Upper Hit", shape.xcross, location.abovebar, color.red, size=size.tiny)
+plotshape(i_showADRHitMarker and adr_lower_hit, "ADR Lower Hit", shape.xcross, location.belowbar, color.green, size=size.tiny)
+
+// Daily levels
+var line pdh_line = na, var line pdl_line = na, var line pdeq_line = na
+var line pdo_line = na, var line pdc_line = na
+var line pd_bh_line = na, var line pd_bl_line = na
+var label pdh_label = na, var label pdl_label = na, var label pdeq_label = na
+
+if barstate.islast
+    line.delete(pdh_line), line.delete(pdl_line), line.delete(pdeq_line)
+    line.delete(pdo_line), line.delete(pdc_line)
+    line.delete(pd_bh_line), line.delete(pd_bl_line)
+    label.delete(pdh_label), label.delete(pdl_label), label.delete(pdeq_label)
+    
+    int lx1 = bar_index - 100
+    int lx2 = bar_index + 10
+    
+    if i_showPDH and not na(pdh)
+        pdh_line := line.new(lx1, pdh, lx2, pdh, color=i_pdhColor, width=i_pdhWidth, style=line.style_solid)
+        pdh_label := label.new(lx2, pdh, "PDH", style=label.style_label_left, color=color.new(i_pdhColor, 80), textcolor=i_pdhColor, size=size.tiny)
+    if i_showPDL and not na(pdl)
+        pdl_line := line.new(lx1, pdl, lx2, pdl, color=i_pdlColor, width=i_pdlWidth, style=line.style_solid)
+        pdl_label := label.new(lx2, pdl, "PDL", style=label.style_label_left, color=color.new(i_pdlColor, 80), textcolor=i_pdlColor, size=size.tiny)
+    if i_showPDEQ and not na(pdeq)
+        pdeq_line := line.new(lx1, pdeq, lx2, pdeq, color=i_pdeqColor, width=i_pdeqWidth, style=line.style_dashed)
+        pdeq_label := label.new(lx2, pdeq, "PD-EQ", style=label.style_label_left, color=color.new(i_pdeqColor, 80), textcolor=i_pdeqColor, size=size.tiny)
+    if i_showPDO and not na(pdo)
+        pdo_line := line.new(lx1, pdo, lx2, pdo, color=i_pdoColor, width=i_pdoWidth, style=line.style_dotted)
+    if i_showPDC and not na(pdc)
+        pdc_line := line.new(lx1, pdc, lx2, pdc, color=i_pdcColor, width=i_pdcWidth, style=line.style_dotted)
+    if i_showPDBodyHigh and not na(pd_body_high)
+        pd_bh_line := line.new(lx1, pd_body_high, lx2, pd_body_high, color=i_pdBodyHighColor, width=i_pdBodyHighWidth, style=line.style_dotted)
+    if i_showPDBodyLow and not na(pd_body_low)
+        pd_bl_line := line.new(lx1, pd_body_low, lx2, pd_body_low, color=i_pdBodyLowColor, width=i_pdBodyLowWidth, style=line.style_dotted)
+
+// Session break lines
+if i_showSessionBreakLine and is_rollover and not is_sunday
+    line.new(bar_index, high * 1.001, bar_index, low * 0.999, color=i_sessionBreakColor, width=i_sessionBreakWidth, style=line.style_solid)
+
+// Day labels
+if i_showDayLabels and is_rollover and not is_sunday
+    int lbl_h = hour(time, tz_effective)
+    string day_text = ""
+    string dow_text = ""
+    
+    int d = dayofweek(time, tz_effective)
+    dow_text := d == dayofweek.monday ? "Mon" : d == dayofweek.tuesday ? "Tue" : d == dayofweek.wednesday ? "Wed" : d == dayofweek.thursday ? "Thu" : d == dayofweek.friday ? "Fri" : "?"
+    
+    string prefix_text = ""
+    if current_prefix == PREFIX_GSD
+        prefix_text := "GSD" + str.tostring(gsd_count) + " "
+    else if current_prefix == PREFIX_RSD
+        prefix_text := "RSD" + str.tostring(rsd_count) + " "
+    
+    string dlabel_text = ""
+    if day_label_type == DLABEL_INSIDE
+        dlabel_text := "[ID] "
+    else if day_label_type == DLABEL_INSIDE_CONT
+        dlabel_text := "[IDC] "
+    else if day_label_type == DLABEL_CLEAN_BULL
+        dlabel_text := "[CB] "
+    else if day_label_type == DLABEL_CLEAN_BEAR
+        dlabel_text := "[CRB] "
+    else if day_label_type == DLABEL_FBR_BULL
+        dlabel_text := "[FBR+] "
+    else if day_label_type == DLABEL_FBR_BEAR
+        dlabel_text := "[FBR-] "
+    
+    day_text := prefix_text + dow_text + " " + dlabel_text
+    
+    color lbl_bg = color.gray
+    color lbl_txt = i_dowLabelTextColor
+    if current_prefix == PREFIX_GSD
+        lbl_bg := i_gsdLabelColor
+        lbl_txt := i_gsdLabelTextColor
+    else if current_prefix == PREFIX_RSD
+        lbl_bg := i_rsdLabelColor
+        lbl_txt := i_rsdLabelTextColor
+    
+    if day_label_type == DLABEL_INSIDE or day_label_type == DLABEL_INSIDE_CONT
+        lbl_bg := i_insideLabelColor
+        lbl_txt := i_insideLabelTextColor
+    else if day_label_type == DLABEL_CLEAN_BULL
+        lbl_bg := i_bullBreakoutColor
+        lbl_txt := i_bullBreakoutTextColor
+    else if day_label_type == DLABEL_CLEAN_BEAR
+        lbl_bg := i_bearBreakoutColor
+        lbl_txt := i_bearBreakoutTextColor
+    
+    label.style lpos = i_dayLabelPosition == "top" ? label.style_label_down : label.style_label_up
+    float lprice = i_dayLabelPosition == "top" ? high * 1.002 : low * 0.998
+    label.new(bar_index, lprice, day_text, style=lpos, color=lbl_bg, textcolor=lbl_txt, size=f_label_size(i_sessionLabelSize))
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 11B: WEEKLY LEVELS (FIX #5: labels at chart edge)
+// ═══════════════════════════════════════════════════════════════════════
+
+var line pwh_line = na, var line pwl_line = na, var line pweq_line = na
+var line cwh_line = na, var line cwl_line = na, var line cweq_line = na
+var label pwh_label = na, var label pwl_label = na, var label pweq_label = na
+var label cwh_label = na, var label cwl_label = na, var label cweq_label = na
+
+if barstate.islast and i_showWeeklyLevels
+    // Delete previous
+    line.delete(pwh_line), line.delete(pwl_line), line.delete(pweq_line)
+    line.delete(cwh_line), line.delete(cwl_line), line.delete(cweq_line)
+    label.delete(pwh_label), label.delete(pwl_label), label.delete(pweq_label)
+    label.delete(cwh_label), label.delete(cwl_label), label.delete(cweq_label)
+    
+    int wk_x1 = bar_index - 200
+    // FIX #5: Position labels at bar_index + small offset (chart edge) instead of current_week_end
+    int wk_x2 = bar_index + 15
+    size lbl_sz = f_label_size(i_weeklyLabelSize)
+    
+    // Previous week levels
+    if i_showPrevWeek and not na(prev_week_high)
+        pwh_line := line.new(wk_x1, prev_week_high, wk_x2, prev_week_high, color=i_prevWeekColor, width=i_prevWeekWidth, style=line.style_dashed)
+        pwl_line := line.new(wk_x1, prev_week_low, wk_x2, prev_week_low, color=i_prevWeekColor, width=i_prevWeekWidth, style=line.style_dashed)
+    if i_showPrevWeek and not na(pweq)
+        pweq_line := line.new(wk_x1, pweq, wk_x2, pweq, color=i_pweqLineColor, width=i_pweqLineWidth, style=line.style_dotted)
+    
+    // FIX #5: Labels at chart edge with subtle background for visibility
+    if i_showWeeklyLabels and i_showPrevWeek
+        if not na(prev_week_high)
+            pwh_label := label.new(wk_x2, prev_week_high, "PWH", style=label.style_label_left, color=color.new(i_prevWeekColor, 75), textcolor=i_weeklyLabelColor, size=lbl_sz)
+        if not na(prev_week_low)
+            pwl_label := label.new(wk_x2, prev_week_low, "PWL", style=label.style_label_left, color=color.new(i_prevWeekColor, 75), textcolor=i_weeklyLabelColor, size=lbl_sz)
+        if not na(pweq)
+            pweq_label := label.new(wk_x2, pweq, "PWEQ", style=label.style_label_left, color=color.new(i_pweqLineColor, 75), textcolor=i_weeklyLabelColor, size=lbl_sz)
+    
+    // Current week levels
+    if i_showCurrWeek and not na(curr_week_high)
+        cwh_line := line.new(wk_x1, curr_week_high, wk_x2, curr_week_high, color=i_currWeekColor, width=i_currWeekWidth, style=line.style_solid)
+        cwl_line := line.new(wk_x1, curr_week_low, wk_x2, curr_week_low, color=i_currWeekColor, width=i_currWeekWidth, style=line.style_solid)
+    if i_showCurrWeek and not na(curr_week_eq)
+        cweq_line := line.new(wk_x1, curr_week_eq, wk_x2, curr_week_eq, color=i_currWeekColor, width=1, style=line.style_dotted)
+    
+    if i_showWeeklyLabels and i_showCurrWeek
+        if not na(curr_week_high)
+            cwh_label := label.new(wk_x2, curr_week_high, "WH", style=label.style_label_left, color=color.new(i_currWeekColor, 75), textcolor=i_weeklyLabelColor, size=lbl_sz)
+        if not na(curr_week_low)
+            cwl_label := label.new(wk_x2, curr_week_low, "WL", style=label.style_label_left, color=color.new(i_currWeekColor, 75), textcolor=i_weeklyLabelColor, size=lbl_sz)
+        if not na(curr_week_eq)
+            cweq_label := label.new(wk_x2, curr_week_eq, "WEQ", style=label.style_label_left, color=color.new(i_currWeekColor, 75), textcolor=i_weeklyLabelColor, size=lbl_sz)
+
+// Exhaustion zone boxes
+if i_showExhaustionAreas and array.size(ez_top) > 0
+    for i = 0 to math.min(array.size(ez_top) - 1, 49)
+        if i < array.size(ez_active) and array.get(ez_active, i)
+            float zt = array.get(ez_top, i)
+            float zb = array.get(ez_bot, i)
+            bool is_bull = i < array.size(ez_is_bull) and array.get(ez_is_bull, i)
+            color zone_col = is_bull ? i_exhaustionBullColor : i_exhaustionBearColor
+            color border_col = na
+            if i_useCustomBorderColor
+                border_col := is_bull ? i_exhaustionBullBorder : i_exhaustionBearBorder
+            else
+                border_col := color.new(is_bull ? color.green : color.red, i_exhaustionBorderOpacity)
+            int zt_time = i < array.size(ez_time) ? array.get(ez_time, i) : time
+            if barstate.islast
+                box.new(bar_index - 50, zt, bar_index + 5, zb, border_col, i_exhaustionBorderWidth, line.style_solid, extend.none, xloc.bar_index, zone_col)
+
+// First-hour exhaustion zones (FIX #7)
+if i_showFirstHourExhaustion and not na(first_hour_high) and not na(first_hour_low) and not first_hour_active
+    if barstate.islast
+        box.new(bar_index - 50, first_hour_high, bar_index + 5, first_hour_low, color.new(color.orange, 50), 1, line.style_dashed, extend.none, xloc.bar_index, color.new(color.orange, 85))
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 12: INFORMATION TABLE
+// ═══════════════════════════════════════════════════════════════════════
+
+if barstate.islast and i_tableMode != "Hidden"
+    var table info_table = table.new(position.top_right, 4, 20, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+    
+    size txt_sz = i_tableTextSize == "tiny" ? size.tiny : i_tableTextSize == "small" ? size.small : i_tableTextSize == "normal" ? size.normal : size.large
+    
+    int row = 0
+    
+    // Title
+    table.cell(info_table, 0, row, "MADSTRAT", text_color=color.white, text_size=txt_sz, bgcolor=color.new(color.blue, 30))
+    table.merge_cells(info_table, 0, row, 3, row)
+    row += 1
+    
+    // Day status
+    string day_status = ""
+    if current_prefix == PREFIX_GSD
+        day_status := "GSD " + str.tostring(gsd_count)
+    else if current_prefix == PREFIX_RSD
+        day_status := "RSD " + str.tostring(rsd_count)
+    else
+        day_status := "No Setup"
+    
+    table.cell(info_table, 0, row, "Day:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+    color day_col = current_prefix == PREFIX_GSD ? color.green : current_prefix == PREFIX_RSD ? color.red : color.gray
+    table.cell(info_table, 1, row, day_status, text_color=day_col, text_size=txt_sz)
+    row += 1
+    
+    // Day label type
+    string dlabel_str = ""
+    if day_label_type == DLABEL_INSIDE
+        dlabel_str := "Inside Day"
+    else if day_label_type == DLABEL_INSIDE_CONT
+        dlabel_str := "Inside Cont"
+    else if day_label_type == DLABEL_CLEAN_BULL
+        dlabel_str := "Clean Bull"
+    else if day_label_type == DLABEL_CLEAN_BEAR
+        dlabel_str := "Clean Bear"
+    else if day_label_type == DLABEL_FBR_BULL
+        dlabel_str := "FBR Bull"
+    else if day_label_type == DLABEL_FBR_BEAR
+        dlabel_str := "FBR Bear"
+    else
+        dlabel_str := "Normal"
+    
+    table.cell(info_table, 0, row, "Type:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+    table.cell(info_table, 1, row, dlabel_str, text_color=color.white, text_size=txt_sz)
+    row += 1
+    
+    if i_tableMode == "Full" or i_tableMode == "Confluence Only"
+        // EMA alignment status
+        table.cell(info_table, 0, row, "H4 EMA:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_table, 1, row, h4_ema_bull ? "BULL" : h4_ema_bear ? "BEAR" : "MIXED", text_color=h4_ema_bull ? color.green : h4_ema_bear ? color.red : color.yellow, text_size=txt_sz)
+        row += 1
+        
+        table.cell(info_table, 0, row, "H1 EMA:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_table, 1, row, h1_ema_bull ? "BULL" : h1_ema_bear ? "BEAR" : "MIXED", text_color=h1_ema_bull ? color.green : h1_ema_bear ? color.red : color.yellow, text_size=txt_sz)
+        row += 1
+        
+        table.cell(info_table, 0, row, "15m EMA:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_table, 1, row, m15_ema_bull ? "BULL" : m15_ema_bear ? "BEAR" : "MIXED", text_color=m15_ema_bull ? color.green : m15_ema_bear ? color.red : color.yellow, text_size=txt_sz)
+        row += 1
+        
+        table.cell(info_table, 0, row, "30m EMA:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_table, 1, row, m30_ema_bull ? "BULL" : m30_ema_bear ? "BEAR" : "MIXED", text_color=m30_ema_bull ? color.green : m30_ema_bear ? color.red : color.yellow, text_size=txt_sz)
+        row += 1
+    
+    if i_tableMode == "Full" or i_tableMode == "Confluence Only"
+        // Confluence scores
+        int d3_conf_long_15 = f_day3_confluence_15m(true)
+        int d3_conf_short_15 = f_day3_confluence_15m(false)
+        int d3_conf_long_30 = f_day3_confluence_30m(true)
+        int d3_conf_short_30 = f_day3_confluence_30m(false)
+        int pure_conf_long_15 = f_pure_confluence_15m(true)
+        int pure_conf_short_15 = f_pure_confluence_15m(false)
+        
+        // Show which system based on setting
+        string conf_system = i_confluenceTableSystem == "15m System" ? "15m" : i_confluenceTableSystem == "30m System" ? "30m" : (timeframe.period == "15" ? "15m" : "30m")
+        
+        table.cell(info_table, 0, row, "─ Confluence ─", text_color=color.aqua, text_size=txt_sz)
+        table.merge_cells(info_table, 0, row, 1, row)
+        row += 1
+        
+        if conf_system == "15m"
+            table.cell(info_table, 0, row, "D3 Long:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+            table.cell(info_table, 1, row, str.tostring(d3_conf_long_15) + "/12", text_color=d3_conf_long_15 >= dyn_threshold ? color.green : color.red, text_size=txt_sz)
+            row += 1
+            table.cell(info_table, 0, row, "D3 Short:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+            table.cell(info_table, 1, row, str.tostring(d3_conf_short_15) + "/12", text_color=d3_conf_short_15 >= dyn_threshold ? color.green : color.red, text_size=txt_sz)
+            row += 1
+            table.cell(info_table, 0, row, "Pure Long:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+            table.cell(info_table, 1, row, str.tostring(pure_conf_long_15) + "/11", text_color=pure_conf_long_15 >= i_pureMinConfluence ? color.green : color.red, text_size=txt_sz)
+            row += 1
+            table.cell(info_table, 0, row, "Pure Short:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+            table.cell(info_table, 1, row, str.tostring(pure_conf_short_15) + "/11", text_color=pure_conf_short_15 >= i_pureMinConfluence ? color.green : color.red, text_size=txt_sz)
+            row += 1
+        else
+            table.cell(info_table, 0, row, "D3 Long:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+            table.cell(info_table, 1, row, str.tostring(d3_conf_long_30) + "/12", text_color=d3_conf_long_30 >= dyn_threshold ? color.green : color.red, text_size=txt_sz)
+            row += 1
+            table.cell(info_table, 0, row, "D3 Short:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+            table.cell(info_table, 1, row, str.tostring(d3_conf_short_30) + "/12", text_color=d3_conf_short_30 >= dyn_threshold ? color.green : color.red, text_size=txt_sz)
+            row += 1
+    
+    if i_tableMode == "Full" or i_tableMode == "Status Only"
+        // ADR info
+        table.cell(info_table, 0, row, "ADR Used:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_table, 1, row, str.tostring(adr_used_pct, "#.0") + "%", text_color=adr_used_pct > 80 ? color.red : adr_used_pct > 60 ? color.yellow : color.green, text_size=txt_sz)
+        row += 1
+        
+        // Position info
+        string pos_text = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+        color pos_col = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+        table.cell(info_table, 0, row, "Position:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_table, 1, row, pos_text, text_color=pos_col, text_size=txt_sz)
+        row += 1
+        
+        // Trail mode
+        if strategy.position_size != 0 and i_trailMode != "None"
+            string trail_status = tp1_hit_long or tp1_hit_short ? "Active: " + i_trailMode : "Waiting TP1"
+            table.cell(info_table, 0, row, "Trail:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+            table.cell(info_table, 1, row, trail_status, text_color=color.aqua, text_size=txt_sz)
+            row += 1
+        
+        // Killzone status
+        table.cell(info_table, 0, row, "Killzone:", text_color=color.white, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_table, 1, row, in_any_killzone ? "ACTIVE" : "OFF", text_color=in_any_killzone ? color.green : color.gray, text_size=txt_sz)
+        row += 1
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 13: ALERTS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Signal alerts
+if i_enableSignalAlerts
+    if i_alertDay3Signals
+        if d3_long_15m
+            alert("Madstrat Day " + str.tostring(setup_day_num) + " BUY 15m | GSD" + str.tostring(gsd_count) + " | " + syminfo.ticker, alert.freq_once_per_bar_close)
+        if d3_short_15m
+            alert("Madstrat Day " + str.tostring(setup_day_num) + " SELL 15m | RSD" + str.tostring(rsd_count) + " | " + syminfo.ticker, alert.freq_once_per_bar_close)
+        if d3_long_30m
+            alert("Madstrat Day " + str.tostring(setup_day_num) + " BUY 30m | GSD" + str.tostring(gsd_count) + " | " + syminfo.ticker, alert.freq_once_per_bar_close)
+        if d3_short_30m
+            alert("Madstrat Day " + str.tostring(setup_day_num) + " SELL 30m | RSD" + str.tostring(rsd_count) + " | " + syminfo.ticker, alert.freq_once_per_bar_close)
+    
+    if i_alertPureSignals
+        if pure_long_15m
+            alert("Pure Madstrat BUY 15m | " + syminfo.ticker, alert.freq_once_per_bar_close)
+        if pure_short_15m
+            alert("Pure Madstrat SELL 15m | " + syminfo.ticker, alert.freq_once_per_bar_close)
+        if pure_long_30m
+            alert("Pure Madstrat BUY 30m | " + syminfo.ticker, alert.freq_once_per_bar_close)
+        if pure_short_30m
+            alert("Pure Madstrat SELL 30m | " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// Exit alerts
+if i_enableExitAlerts
+    if strategy.position_size == 0 and strategy.position_size[1] > 0
+        alert("Madstrat LONG Closed | " + syminfo.ticker, alert.freq_once_per_bar_close)
+    if strategy.position_size == 0 and strategy.position_size[1] < 0
+        alert("Madstrat SHORT Closed | " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// Day classification alerts
+if i_enableDayAlerts and is_rollover and not is_sunday
+    string day_alert = ""
+    if current_prefix == PREFIX_GSD
+        day_alert := "GSD Day " + str.tostring(gsd_count)
+    else if current_prefix == PREFIX_RSD
+        day_alert := "RSD Day " + str.tostring(rsd_count)
+    
+    if day_label_type == DLABEL_INSIDE
+        day_alert += " [Inside Day]"
+    else if day_label_type == DLABEL_CLEAN_BULL
+        day_alert += " [Clean Bullish Breakout]"
+    else if day_label_type == DLABEL_CLEAN_BEAR
+        day_alert += " [Clean Bearish Breakout]"
+    else if day_label_type == DLABEL_FBR_BULL
+        day_alert += " [FBR Bullish]"
+    else if day_label_type == DLABEL_FBR_BEAR
+        day_alert += " [FBR Bearish]"
+    
+    if day_alert != ""
+        alert(day_alert + " | " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// Baseline touch alerts
+if i_alertHTFBaseline
+    float bl_tolerance = i_blAlertMode == "Exact Touch" ? 0 : i_blAlertMode == "1 pip" ? pip_val : i_blAlertMode == "3 pips" ? 3 * pip_val : i_blAlertMode == "5 pips" ? 5 * pip_val : i_blAlertCustomPips * pip_val
+    
+    if i_alert1hrBaseline and not na(htf_1hr_ema50)
+        if math.abs(close - htf_1hr_ema50) <= bl_tolerance
+            alert("1hr Baseline Touch | " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+    if i_alert2hrBaseline and not na(htf_2hr_ema50)
+        if math.abs(close - htf_2hr_ema50) <= bl_tolerance
+            alert("2hr Baseline Touch | " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if i_alertLTFBaseline
+    float bl_tolerance = i_blAlertMode == "Exact Touch" ? 0 : i_blAlertMode == "1 pip" ? pip_val : i_blAlertMode == "3 pips" ? 3 * pip_val : i_blAlertMode == "5 pips" ? 5 * pip_val : i_blAlertCustomPips * pip_val
+    
+    if i_alert15mBaseline and not na(ltf_15m_ema50)
+        if math.abs(close - ltf_15m_ema50) <= bl_tolerance
+            alert("15m Baseline Touch | " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+    if i_alert30mBaseline and not na(ltf_30m_ema50)
+        if math.abs(close - ltf_30m_ema50) <= bl_tolerance
+            alert("30m Baseline Touch | " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ═══════════════════════════════════════════════════════════════════════
+// END OF STRATEGY
+// ═══════════════════════════════════════════════════════════════════════
