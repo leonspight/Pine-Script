@@ -302,6 +302,7 @@ bool i_showHTFContext = input.bool(false, "Show HTF Context Zones", group=group_
 int i_htfContextOpacity = input.int(85, "HTF Context Opacity", minval=50, maxval=95, group=group_exhaustion_cascade)
 string i_exhaustionDisplayTF = input.string("Auto (Match Signal TF)", "Display Zones From", options=["Auto (Match Signal TF)", "15m Only", "30m Only", "H1 Only", "H4 Only", "All Levels"], group=group_exhaustion_cascade)
 bool i_terminateAtRollover = input.bool(true, "Terminate at Daily Rollover", group=group_exhaustion_cascade)
+bool i_hideExhaustionOnHTF = input.bool(true, "Auto-Hide Zones on 2hr+ Charts", group=group_exhaustion_cascade, tooltip="Hides exhaustion cascade boxes when the chart timeframe is 2 hours or higher. These zones are designed for lower timeframe trading and become oversized on HTF charts.")
 string group_weekly = "Weekly Levels"
 bool i_showWeeklyLevels = input.bool(true, "Show Weekly Levels", group=group_weekly)
 bool i_showPrevWeek = input.bool(true, "Show Previous Week", group=group_weekly)
@@ -2532,7 +2533,10 @@ _prev_display_bull := display_is_bull
 _prev_display_level := display_level
 _prev_h4_top := active_h4_top
 _prev_h1_top := active_h1_top
-if i_showExhaustionAreas
+// --- HTF gate: suppress oversized exhaustion boxes on 2hr+ charts ---
+float _chart_tf_mins = timeframe.isminutes ? timeframe.multiplier * 1.0 : timeframe.isdaily ? 1440.0 : timeframe.isweekly ? 10080.0 : timeframe.ismonthly ? 43200.0 : timeframe.isseconds ? timeframe.multiplier / 60.0 : 60.0
+bool _exhaustion_htf_hidden = i_hideExhaustionOnHTF and _chart_tf_mins >= 120
+if i_showExhaustionAreas and not _exhaustion_htf_hidden
     if _cascade_changed
         box.delete(primary_exh_box)
         box.delete(h4_context_box)
@@ -2621,7 +2625,7 @@ if rollover5 and i_terminateAtRollover
 f_session_zone_height(_high, _low) =>
     float _range = _high - _low
     _range > 0 ? _range * 0.1 : syminfo.mintick * 100
-if i_showExhaustionAreas and i_showSessionExhaustion
+if i_showExhaustionAreas and i_showSessionExhaustion and not _exhaustion_htf_hidden
     bool asia_just_closed = in_asian[1] and not in_asian
     if i_showAsiaExhaustion and asia_just_closed and not na(asia_session_high) and not na(asia_session_low)
         float asia_zone_h = f_session_zone_height(asia_session_high, asia_session_low)
